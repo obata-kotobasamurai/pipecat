@@ -45,6 +45,21 @@ except ModuleNotFoundError as e:
     raise Exception(f"Missing module: {e}")
 
 
+def _is_cjk_language(language: Optional[Language]) -> bool:
+    """Check if the language is a CJK language (Chinese, Japanese, Korean).
+
+    Args:
+        language: The language to check.
+
+    Returns:
+        True if the language is Chinese, Japanese, or Korean.
+    """
+    if language is None:
+        return False
+    lang_code = language.value.lower()
+    return lang_code.startswith(("ja", "ko", "zh"))
+
+
 def sample_rate_to_output_format(sample_rate: int) -> SpeechSynthesisOutputFormat:
     """Convert sample rate to Azure speech synthesis output format.
 
@@ -333,6 +348,8 @@ class AzureTTSService(WordTTSService):
         self._word_timestamps_started = False
         self._synthesis_lock = asyncio.Lock()
         self._cumulative_audio_offset: float = 0.0  # Cumulative audio duration in seconds
+        # Set CJK language flag for proper text frame spacing handling
+        self._cjk_language = _is_cjk_language(params.language)
 
     def can_generate_metrics(self) -> bool:
         """Check if this service can generate processing metrics.

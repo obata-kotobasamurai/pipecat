@@ -654,6 +654,7 @@ class WordTTSService(TTSService):
         self._initial_word_times = []
         self._words_task = None
         self._llm_response_started: bool = False
+        self._cjk_language: bool = False
 
     async def start_word_timestamps(self):
         """Start tracking word timestamps from the current time."""
@@ -757,9 +758,12 @@ class WordTTSService(TTSService):
                 frame = TTSStoppedFrame()
                 frame.pts = last_pts
             else:
-                # Assumption: word-by-word text frames don't include spaces, so
-                # we can rely on the default includes_inter_frame_spaces=False
+                # For CJK languages (Chinese, Japanese, Korean), words don't have
+                # inter-word spaces, so we set includes_inter_frame_spaces=True to
+                # prevent unwanted space insertion during text concatenation.
                 frame = TTSTextFrame(word, aggregated_by=AggregationType.WORD)
+                if self._cjk_language:
+                    frame.includes_inter_frame_spaces = True
                 frame.pts = self._initial_word_timestamp + timestamp
             if frame:
                 last_pts = frame.pts
