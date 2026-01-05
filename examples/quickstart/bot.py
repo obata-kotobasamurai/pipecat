@@ -10,9 +10,9 @@ The example runs a simple voice AI bot that you can connect to using your
 browser and speak with it. You can also deploy this bot to Pipecat Cloud.
 
 Required AI services:
-- Deepgram (Speech-to-Text)
-- OpenAI (LLM)
-- Cartesia (Text-to-Speech)
+- Soniox (Speech-to-Text)
+- OpenRouter (LLM)
+- Azure (Text-to-Speech)
 
 Run the bot using::
 
@@ -48,9 +48,9 @@ from pipecat.processors.aggregators.llm_response_universal import LLMContextAggr
 from pipecat.processors.frameworks.rtvi import RTVIConfig, RTVIObserver, RTVIProcessor
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
-from pipecat.services.cartesia.tts import CartesiaTTSService
-from pipecat.services.deepgram.stt import DeepgramSTTService
-from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.azure.tts import AzureBaseTTSService, AzureTTSService
+from pipecat.services.openrouter.llm import OpenRouterLLMService
+from pipecat.services.soniox.stt import SonioxInputParams, SonioxSTTService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
 
@@ -62,14 +62,27 @@ load_dotenv(override=True)
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info(f"Starting bot")
 
-    stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
-
-    tts = CartesiaTTSService(
-        api_key=os.getenv("CARTESIA_API_KEY"),
-        voice_id="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
+    stt = SonioxSTTService(
+        api_key=os.getenv("SONIOX_API_KEY"),
+        params=SonioxInputParams(
+            language_hints=["ja"],
+        ),
     )
 
-    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
+    tts = AzureTTSService(
+        api_key=os.getenv("AZURE_SPEECH_API_KEY"),
+        region=os.getenv("AZURE_SPEECH_REGION"),
+        voice="ja-JP-NanamiNeural",
+        params=AzureBaseTTSService.InputParams(
+            style="customerservice",
+        ),
+    )
+
+    llm = OpenRouterLLMService(
+        api_key=os.getenv("OPENROUTER_API_KEY"),
+        model="google/gemini-3-flash-preview",
+        max_completion_tokens=500,
+    )
 
     messages = [
         {
