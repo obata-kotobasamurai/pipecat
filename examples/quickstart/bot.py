@@ -75,6 +75,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         voice="ja-JP-NanamiNeural",
         params=AzureBaseTTSService.InputParams(
             style="customerservice",
+            language="ja-JP",
         ),
     )
 
