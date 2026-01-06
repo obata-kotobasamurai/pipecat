@@ -65,11 +65,11 @@ def sample_rate_to_output_format(sample_rate: int) -> SpeechSynthesisOutputForma
 
 
 class AzureBaseTTSService:
-    """Mixin class for Azure Cognitive Services text-to-speech implementations.
+    """Base mixin class for Azure Cognitive Services text-to-speech implementations.
 
     Provides common functionality for Azure TTS services including SSML
-    construction, voice configuration, and parameter management. This class
-    is designed to be used as a mixin with TTSService or WordTTSService.
+    construction, voice configuration, and parameter management.
+    This is a mixin class and should be used alongside TTSService or its subclasses.
     """
 
     # Define SSML escape mappings based on SSML reserved characters
@@ -113,7 +113,9 @@ class AzureBaseTTSService:
         voice: str = "en-US-SaraNeural",
         params: Optional[InputParams] = None,
     ):
-        """Initialize the Azure TTS service with configuration parameters.
+        """Initialize Azure-specific configuration.
+
+        This method should be called by subclasses after initializing their TTSService parent.
 
         Args:
             api_key: Azure Cognitive Services subscription key.
@@ -161,14 +163,6 @@ class AzureBaseTTSService:
         return language_to_azure_language(language)
 
     def _construct_ssml(self, text: str) -> str:
-        """Construct SSML from text with current voice settings.
-
-        Args:
-            text: The text to convert to SSML.
-
-        Returns:
-            SSML string for Azure TTS synthesis.
-        """
         language = self._settings["language"]
 
         # Escape special characters
@@ -255,6 +249,7 @@ class AzureTTSService(WordTTSService, AzureBaseTTSService):
         voice: str = "en-US-SaraNeural",
         sample_rate: Optional[int] = None,
         params: Optional[AzureBaseTTSService.InputParams] = None,
+        aggregate_sentences: bool = True,
         **kwargs,
     ):
         """Initialize the Azure streaming TTS service.
@@ -265,24 +260,26 @@ class AzureTTSService(WordTTSService, AzureBaseTTSService):
             voice: Voice name to use for synthesis. Defaults to "en-US-SaraNeural".
             sample_rate: Audio sample rate in Hz. If None, uses service default.
             params: Voice and synthesis parameters configuration.
+            aggregate_sentences: Whether to aggregate sentences before synthesis.
             **kwargs: Additional arguments passed to parent WordTTSService.
         """
-        # We want to push text frames ourselves with word-level timing
+        # Initialize WordTTSService first to set up word timestamp tracking
         super().__init__(
-            aggregate_sentences=True,
-            push_text_frames=False,
+            aggregate_sentences=aggregate_sentences,
+            push_text_frames=False,  # We'll push text frames based on word timestamps
+            push_stop_frames=True,
             pause_frame_processing=True,
             sample_rate=sample_rate,
             **kwargs,
         )
 
-        # Initialize Azure-specific settings via mixin
+        # Initialize Azure-specific functionality from mixin
         self._init_azure_base(api_key=api_key, region=region, voice=voice, params=params)
 
         self._speech_config = None
+        self._speech_synthesizer = None
         self._audio_queue = asyncio.Queue()
-        self._context_id = None
-        self._word_timestamps_started = False
+        self._started = False
         self._cumulative_audio_offset: float = 0.0  # Cumulative audio duration in seconds
 
     async def start(self, frame: StartFrame):
@@ -340,8 +337,8 @@ class AzureTTSService(WordTTSService, AzureBaseTTSService):
 
         # Queue the word timestamp for processing
         # Use put_nowait since this is a synchronous callback
-        if self._context_id and word:
-            logger.debug(f"{self}: Word boundary - '{word}' at {absolute_seconds:.2f}s")
+        if word:
+            logger.trace(f"{self}: Word boundary - '{word}' at {absolute_seconds:.2f}s")
             try:
                 # Convert to nanoseconds and put directly in queue (sync operation)
                 timestamp_ns = seconds_to_nanoseconds(absolute_seconds)
@@ -369,14 +366,6 @@ class AzureTTSService(WordTTSService, AzureBaseTTSService):
             self._cumulative_audio_offset += evt.result.audio_duration.total_seconds()
 
         self._audio_queue.put_nowait(None)  # Signal completion
-        # Add completion markers to word timestamp queue
-        # Use put_nowait since this is a synchronous callback
-        if self._context_id:
-            try:
-                # Add TTSStoppedFrame marker but NOT Reset - we maintain cumulative PTS
-                self._words_queue.put_nowait(("TTSStoppedFrame", 0))
-            except Exception as e:
-                logger.error(f"{self} error finalizing word timestamps: {e}")
 
     def _handle_canceled(self, evt):
         """Handle synthesis cancellation.
@@ -387,11 +376,22 @@ class AzureTTSService(WordTTSService, AzureBaseTTSService):
         logger.error(f"Speech synthesis canceled: {evt.result.cancellation_details.reason}")
         self._audio_queue.put_nowait(None)
 
+    async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
+        """Push a frame and handle state changes.
+
+        Args:
+            frame: The frame to push.
+            direction: The direction to push the frame.
+        """
+        await super().push_frame(frame, direction)
+        if isinstance(frame, (TTSStoppedFrame, InterruptionFrame)):
+            self._started = False
+            if isinstance(frame, TTSStoppedFrame):
+                await self.add_word_timestamps([("Reset", 0)])
+
     async def flush_audio(self):
         """Flush any pending audio data."""
         logger.trace(f"{self}: flushing audio")
-        # Reset cumulative audio offset at end of LLM response
-        self._cumulative_audio_offset = 0.0
 
     async def _handle_interruption(self, frame: InterruptionFrame, direction: FrameDirection):
         """Handle interruption by stopping current synthesis.
@@ -411,7 +411,6 @@ class AzureTTSService(WordTTSService, AzureBaseTTSService):
                 self._audio_queue.task_done()
             except asyncio.QueueEmpty:
                 break
-        self._context_id = None
 
     @traced_tts
     async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
@@ -440,12 +439,12 @@ class AzureTTSService(WordTTSService, AzureBaseTTSService):
                 return
 
             try:
-                await self.start_ttfb_metrics()
-                yield TTSStartedFrame()
-
-                # Mark that we're starting a new synthesis
-                self._context_id = str(id(text))
-                self._word_timestamps_started = False
+                if not self._started:
+                    await self.start_ttfb_metrics()
+                    await self.start_word_timestamps()
+                    yield TTSStartedFrame()
+                    self._started = True
+                    self._cumulative_audio_offset = 0.0
 
                 ssml = self._construct_ssml(text)
                 self._speech_synthesizer.speak_ssml_async(ssml)
@@ -458,11 +457,6 @@ class AzureTTSService(WordTTSService, AzureBaseTTSService):
                         break
 
                     await self.stop_ttfb_metrics()
-                    # Start word timestamps only once when we receive first audio
-                    if not self._word_timestamps_started:
-                        self.start_word_timestamps()
-                        self._word_timestamps_started = True
-
                     frame = TTSAudioRawFrame(
                         audio=chunk,
                         sample_rate=self.sample_rate,
@@ -470,13 +464,10 @@ class AzureTTSService(WordTTSService, AzureBaseTTSService):
                     )
                     yield frame
 
-                # Clear context ID when done
-                self._context_id = None
-                yield TTSStoppedFrame()
-
             except Exception as e:
                 logger.error(f"{self} error during synthesis: {e}")
                 yield TTSStoppedFrame()
+                self._started = False
                 # Could add reconnection logic here if needed
                 return
 
@@ -514,10 +505,11 @@ class AzureHttpTTSService(TTSService, AzureBaseTTSService):
         """
         super().__init__(sample_rate=sample_rate, **kwargs)
 
-        # Initialize Azure-specific settings via mixin
+        # Initialize Azure-specific functionality from mixin
         self._init_azure_base(api_key=api_key, region=region, voice=voice, params=params)
 
         self._speech_config = None
+        self._speech_synthesizer = None
 
     async def start(self, frame: StartFrame):
         """Start the Azure HTTP TTS service and initialize speech synthesizer.
