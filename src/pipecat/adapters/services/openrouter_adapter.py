@@ -11,12 +11,12 @@ for providers like Gemini that don't support multiple system messages in
 conversation history.
 """
 
-from typing import List
+from typing import Any, Dict, List
 
 from openai.types.chat import ChatCompletionMessageParam
 
 from pipecat.adapters.services.open_ai_adapter import OpenAILLMAdapter
-from pipecat.processors.aggregators.llm_context import LLMContextMessage, LLMSpecificMessage
+from pipecat.processors.aggregators.llm_context import LLMContext, LLMContextMessage, LLMSpecificMessage
 
 
 class OpenRouterLLMAdapter(OpenAILLMAdapter):
@@ -30,6 +30,17 @@ class OpenRouterLLMAdapter(OpenAILLMAdapter):
     keeping only the first system message as an actual system message. This
     matches the behavior of the native Gemini adapter.
     """
+
+    def get_messages_for_logging(self, context: LLMContext) -> List[Dict[str, Any]]:
+        """Get messages with system message conversion applied for accurate logging.
+
+        Args:
+            context: The LLM context containing messages.
+
+        Returns:
+            List of messages showing the actual converted format sent to the API.
+        """
+        return self._from_universal_context_messages(self.get_messages(context))
 
     def _from_universal_context_messages(
         self, messages: List[LLMContextMessage]
