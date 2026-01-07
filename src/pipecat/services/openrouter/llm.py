@@ -8,12 +8,17 @@
 
 This module provides an OpenAI-compatible interface for interacting with OpenRouter's API,
 extending the base OpenAI LLM service functionality.
+
+The service includes special handling for system messages to support providers like Gemini
+that don't handle multiple system messages well. Mid-conversation system messages are
+automatically converted to user messages.
 """
 
 from typing import Optional
 
 from loguru import logger
 
+from pipecat.adapters.services.openrouter_adapter import OpenRouterLLMAdapter
 from pipecat.services.openai.llm import OpenAILLMService
 
 
@@ -22,7 +27,13 @@ class OpenRouterLLMService(OpenAILLMService):
 
     This service extends OpenAILLMService to connect to OpenRouter's API endpoint while
     maintaining full compatibility with OpenAI's interface and functionality.
+
+    The service uses OpenRouterLLMAdapter which converts mid-conversation system messages
+    to user messages. This is necessary for providers like Gemini that don't support
+    multiple system messages inline in conversation history.
     """
+
+    adapter_class = OpenRouterLLMAdapter
 
     def __init__(
         self,
