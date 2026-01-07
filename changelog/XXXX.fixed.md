@@ -1,0 +1,1 @@
+- Fixed word timestamp timing alignment in `AzureTTSService` by capturing base timestamp when first audio chunk arrives.

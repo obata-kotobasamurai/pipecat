@@ -1,0 +1,1 @@
+- Added word-level timestamp support to `AzureTTSService` for accurate text-to-audio synchronization.
