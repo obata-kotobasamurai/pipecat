@@ -280,6 +280,7 @@ class AzureTTSService(WordTTSService, AzureBaseTTSService):
         self._speech_synthesizer = None
         self._audio_queue = asyncio.Queue()
         self._started = False
+        self._first_chunk = False
         self._cumulative_audio_offset: float = 0.0  # Cumulative audio duration in seconds
 
     async def start(self, frame: StartFrame):
@@ -443,10 +444,10 @@ class AzureTTSService(WordTTSService, AzureBaseTTSService):
                     await self.start_ttfb_metrics()
                     yield TTSStartedFrame()
                     self._started = True
+                    self._first_chunk = True
                     self._cumulative_audio_offset = 0.0
 
                 ssml = self._construct_ssml(text)
-                await self.start_word_timestamps()
                 self._speech_synthesizer.speak_ssml_async(ssml)
                 await self.start_tts_usage_metrics(text)
 
@@ -457,6 +458,12 @@ class AzureTTSService(WordTTSService, AzureBaseTTSService):
                         break
 
                     await self.stop_ttfb_metrics()
+
+                    # Start word timestamps when first chunk arrives
+                    if self._first_chunk:
+                        await self.start_word_timestamps()
+                        self._first_chunk = False
+
                     frame = TTSAudioRawFrame(
                         audio=chunk,
                         sample_rate=self.sample_rate,
