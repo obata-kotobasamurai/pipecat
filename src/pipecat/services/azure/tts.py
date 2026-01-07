@@ -43,6 +43,21 @@ except ModuleNotFoundError as e:
     raise Exception(f"Missing module: {e}")
 
 
+def _is_cjk_language(language: Optional[Language]) -> bool:
+    """Check if the language is a CJK language (Chinese, Japanese, Korean).
+
+    Args:
+        language: The language to check.
+
+    Returns:
+        True if the language is Chinese, Japanese, or Korean.
+    """
+    if language is None:
+        return False
+    lang_code = language.value.lower()
+    return lang_code.startswith(("ja", "ko", "zh"))
+
+
 def sample_rate_to_output_format(sample_rate: int) -> SpeechSynthesisOutputFormat:
     """Convert sample rate to Azure speech synthesis output format.
 
@@ -281,6 +296,8 @@ class AzureTTSService(WordTTSService, AzureBaseTTSService):
         self._audio_queue = asyncio.Queue()
         self._started = False
         self._cumulative_audio_offset: float = 0.0  # Cumulative audio duration in seconds
+        # Set CJK language flag for proper text frame spacing handling
+        self._cjk_language = _is_cjk_language(params.language if params else None)
 
     async def start(self, frame: StartFrame):
         """Start the Azure TTS service and initialize speech synthesizer.
@@ -441,9 +458,9 @@ class AzureTTSService(WordTTSService, AzureBaseTTSService):
             try:
                 if not self._started:
                     await self.start_ttfb_metrics()
-                    await self.start_word_timestamps()
                     yield TTSStartedFrame()
                     self._started = True
+                    self._first_chunk = True
                     self._cumulative_audio_offset = 0.0
 
                 ssml = self._construct_ssml(text)
@@ -457,6 +474,12 @@ class AzureTTSService(WordTTSService, AzureBaseTTSService):
                         break
 
                     await self.stop_ttfb_metrics()
+
+                    # Start word timestamps when first chunk arrives
+                    if self._first_chunk:
+                        await self.start_word_timestamps()
+                        self._first_chunk = False
+
                     frame = TTSAudioRawFrame(
                         audio=chunk,
                         sample_rate=self.sample_rate,
