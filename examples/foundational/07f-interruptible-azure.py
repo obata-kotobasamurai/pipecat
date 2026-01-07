@@ -32,6 +32,10 @@ from pipecat.transports.daily.transport import DailyParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
+from pipecat.observers.loggers.debug_log_observer import DebugLogObserver, FrameEndpoint
+from pipecat.frames.frames import LLMRunFrame, TTSTextFrame
+from pipecat.transports.base_output import BaseOutputTransport
+from pipecat.services.openrouter.llm import OpenRouterLLMService
 
 load_dotenv(override=True)
 
@@ -70,10 +74,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         region=os.getenv("AZURE_SPEECH_REGION"),
     )
 
-    llm = AzureLLMService(
-        api_key=os.getenv("AZURE_CHATGPT_API_KEY"),
-        endpoint=os.getenv("AZURE_CHATGPT_ENDPOINT"),
-        model=os.getenv("AZURE_CHATGPT_MODEL"),
+    llm = OpenRouterLLMService(
+        api_key=os.getenv("OPENROUTER_API_KEY"),
+        model="google/gemini-3-flash-preview",
+        max_completion_tokens=500,
     )
 
     messages = [
@@ -111,6 +115,13 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             enable_metrics=True,
             enable_usage_metrics=True,
         ),
+        observers=[
+            DebugLogObserver(
+                frame_types={
+                    TTSTextFrame: (BaseOutputTransport, FrameEndpoint.SOURCE),
+                }
+            ),
+        ],
         idle_timeout_secs=runner_args.pipeline_idle_timeout_secs,
     )
 
@@ -132,6 +143,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
 
 async def bot(runner_args: RunnerArguments):
+
     """Main bot entry point compatible with Pipecat Cloud."""
     transport = await create_transport(runner_args, transport_params)
     await run_bot(transport, runner_args)

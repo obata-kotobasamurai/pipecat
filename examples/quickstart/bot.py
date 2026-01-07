@@ -72,11 +72,6 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     tts = AzureTTSService(
         api_key=os.getenv("AZURE_SPEECH_API_KEY"),
         region=os.getenv("AZURE_SPEECH_REGION"),
-        voice="ja-JP-NanamiNeural",
-        params=AzureBaseTTSService.InputParams(
-            style="customerservice",
-            language="ja-JP",
-        ),
     )
 
     llm = OpenRouterLLMService(
@@ -123,7 +118,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     async def on_client_connected(transport, client):
         logger.info(f"Client connected")
         # Kick off the conversation.
-        messages.append({"role": "system", "content": "Say hello and briefly introduce yourself. 日本語で話してください。ｓｓ"})
+        messages.append({"role": "system", "content": "Say hello and briefly introduce yourself. "})
         await task.queue_frames([LLMRunFrame()])
 
     @transport.event_handler("on_client_disconnected")
