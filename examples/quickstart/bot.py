@@ -53,6 +53,8 @@ from pipecat.services.openrouter.llm import OpenRouterLLMService
 from pipecat.services.soniox.stt import SonioxInputParams, SonioxSTTService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
+from pipecat.observers.loggers.debug_log_observer import DebugLogObserver, FrameEndpoint
+from pipecat.frames.frames import LLMRunFrame, TTSTextFrame
 
 logger.info("✅ All components loaded successfully!")
 
@@ -64,9 +66,6 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     stt = SonioxSTTService(
         api_key=os.getenv("SONIOX_API_KEY"),
-        params=SonioxInputParams(
-            language_hints=["ja"],
-        ),
     )
 
     tts = AzureTTSService(
@@ -111,7 +110,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             enable_metrics=True,
             enable_usage_metrics=True,
         ),
-        observers=[RTVIObserver(rtvi)],
+        observers=[RTVIObserver(rtvi), DebugLogObserver(frame_types={TTSTextFrame: (BaseOutputTransport, FrameEndpoint.SOURCE)})],
     )
 
     @transport.event_handler("on_client_connected")

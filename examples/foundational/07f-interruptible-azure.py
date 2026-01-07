@@ -36,6 +36,9 @@ from pipecat.observers.loggers.debug_log_observer import DebugLogObserver, Frame
 from pipecat.frames.frames import LLMRunFrame, TTSTextFrame
 from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.services.openrouter.llm import OpenRouterLLMService
+from pipecat.services.soniox.stt import SonioxInputParams, SonioxSTTService
+from pipecat.services.openrouter.llm import OpenRouterLLMService
+from pipecat.services.azure.tts import AzureBaseTTSService, AzureTTSService
 
 load_dotenv(override=True)
 
@@ -64,9 +67,8 @@ transport_params = {
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info(f"Starting bot")
 
-    stt = AzureSTTService(
-        api_key=os.getenv("AZURE_SPEECH_API_KEY"),
-        region=os.getenv("AZURE_SPEECH_REGION"),
+    stt = SonioxSTTService(
+        api_key=os.getenv("SONIOX_API_KEY"),
     )
 
     tts = AzureTTSService(
