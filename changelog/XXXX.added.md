@@ -1,0 +1,1 @@
+- Added `OpenRouterLLMAdapter` that converts mid-conversation system messages to user messages. This fixes compatibility issues with Gemini models via OpenRouter when using pipecat-flows, which injects multiple system prompts.
