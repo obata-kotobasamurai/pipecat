@@ -59,15 +59,27 @@ class AmiVoiceInputParams(BaseModel):
 
     Parameters:
         engine: Speech recognition engine name. Defaults to "-a-general" (general-purpose).
-        audio_format: Audio format specification. Defaults to "16K" (16bit 16kHz PCM).
-        result_updated_interval: Interval for interim results in milliseconds. Defaults to 100.
+        result_updated_interval: Interval for interim results in milliseconds. Defaults to 300.
         output_format: Output text format (written/spoken). Defaults to WRITTEN.
     """
 
     engine: str = "-a-general"
-    audio_format: str = "16K"
     result_updated_interval: int = 300
     output_format: OutputFormat = OutputFormat.WRITTEN
+
+
+def _audio_format_from_sample_rate(sample_rate: int) -> str:
+    """Get AmiVoice audio format string from sample rate.
+
+    Args:
+        sample_rate: Audio sample rate in Hz.
+
+    Returns:
+        AmiVoice audio format string ("8K" or "16K").
+    """
+    if sample_rate <= 8000:
+        return "8K"
+    return "16K"
 
 
 class AmiVoiceSTTService(WebsocketSTTService):
@@ -236,9 +248,12 @@ class AmiVoiceSTTService(WebsocketSTTService):
         if not self._websocket or self._websocket.state is not State.OPEN:
             await self._connect_websocket()
 
+        # Determine audio format from sample rate
+        audio_format = _audio_format_from_sample_rate(self.sample_rate)
+
         # Build s command: s <audio_format> <engine> <parameters>
         s_command = (
-            f"s {self._params.audio_format} {self._params.engine} "
+            f"s {audio_format} {self._params.engine} "
             f"authorization={self._api_key} "
             f"resultUpdatedInterval={self._params.result_updated_interval}"
         )
