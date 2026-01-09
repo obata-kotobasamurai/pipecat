@@ -66,7 +66,7 @@ class AmiVoiceInputParams(BaseModel):
 
     engine: str = "-a-general"
     audio_format: str = "16K"
-    result_updated_interval: int = 100
+    result_updated_interval: int = 300
     output_format: OutputFormat = OutputFormat.WRITTEN
 
 
