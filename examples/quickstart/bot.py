@@ -80,6 +80,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     tts = AzureTTSService(
         api_key=os.getenv("AZURE_SPEECH_API_KEY"),
         region=os.getenv("AZURE_SPEECH_REGION"),
+        voice="ja-JP-NanamiNeural",
     )
 
     llm = OpenRouterLLMService(

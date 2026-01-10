@@ -2180,6 +2180,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+amivoice = [
+    { name = "websockets" },
+]
 azure = [
     { name = "azure-cognitiveservices-speech" },
 ]
@@ -2273,6 +2276,7 @@ requires-dist = [
     { name = "ormsgpack", marker = "extra == 'fish'", specifier = "~=1.7.0" },
     { name = "pillow", specifier = ">=11.1.0,<12" },
     { name = "pipecat-ai", extras = ["nvidia"], marker = "extra == 'riva'" },
+    { name = "pipecat-ai", extras = ["websockets-base"], marker = "extra == 'amivoice'" },
     { name = "pipecat-ai", extras = ["websockets-base"], marker = "extra == 'assemblyai'" },
     { name = "pipecat-ai", extras = ["websockets-base"], marker = "extra == 'asyncai'" },
     { name = "pipecat-ai", extras = ["websockets-base"], marker = "extra == 'aws'" },
@@ -2324,7 +2328,7 @@ requires-dist = [
     { name = "wait-for2", marker = "python_full_version < '3.12'", specifier = ">=0.4.1" },
     { name = "websockets", marker = "extra == 'websockets-base'", specifier = ">=13.1,<16.0" },
 ]
-provides-extras = ["aic", "anthropic", "assemblyai", "asyncai", "aws", "aws-nova-sonic", "azure", "cartesia", "cerebras", "daily", "deepgram", "deepseek", "elevenlabs", "fal", "fireworks", "fish", "gladia", "google", "gradium", "grok", "groq", "gstreamer", "heygen", "hume", "inworld", "koala", "krisp", "langchain", "livekit", "lmnt", "local", "local-smart-turn", "local-smart-turn-v3", "mcp", "mem0", "mistral", "mlx-whisper", "moondream", "neuphonic", "noisereduce", "nvidia", "openai", "rnnoise", "openpipe", "openrouter", "perplexity", "playht", "qwen", "remote-smart-turn", "rime", "riva", "runner", "sagemaker", "sambanova", "sarvam", "sentry", "silero", "simli", "soniox", "soundfile", "speechmatics", "strands", "tavus", "together", "tracing", "ultravox", "webrtc", "websocket", "websockets-base", "whisper"]
+provides-extras = ["aic", "amivoice", "anthropic", "assemblyai", "asyncai", "aws", "aws-nova-sonic", "azure", "cartesia", "cerebras", "daily", "deepgram", "deepseek", "elevenlabs", "fal", "fireworks", "fish", "gladia", "google", "gradium", "grok", "groq", "gstreamer", "heygen", "hume", "inworld", "koala", "krisp", "langchain", "livekit", "lmnt", "local", "local-smart-turn", "local-smart-turn-v3", "mcp", "mem0", "mistral", "mlx-whisper", "moondream", "neuphonic", "noisereduce", "nvidia", "openai", "rnnoise", "openpipe", "openrouter", "perplexity", "playht", "qwen", "remote-smart-turn", "rime", "riva", "runner", "sagemaker", "sambanova", "sarvam", "sentry", "silero", "simli", "soniox", "soundfile", "speechmatics", "strands", "tavus", "together", "tracing", "ultravox", "webrtc", "websocket", "websockets-base", "whisper"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -2385,7 +2389,7 @@ name = "pipecat-quickstart"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
-    { name = "pipecat-ai", extra = ["azure", "cartesia", "daily", "deepgram", "local-smart-turn-v3", "openai", "runner", "silero", "soniox", "webrtc"] },
+    { name = "pipecat-ai", extra = ["amivoice", "azure", "cartesia", "daily", "deepgram", "local-smart-turn-v3", "openai", "runner", "silero", "soniox", "webrtc"] },
     { name = "pipecat-ai-cli" },
 ]
 
