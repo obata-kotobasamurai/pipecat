@@ -395,9 +395,6 @@ class AmiVoiceSTTService(WebsocketSTTService):
                 await self.push_error(error_msg=f"AmiVoice session end error: {payload}")
             else:
                 logger.debug("AmiVoice session ended successfully")
-                # If audio was buffered while session was ending, start new session
-                if self._audio_buffer:
-                    await self._start_session()
 
         else:
             logger.debug(f"Unknown AmiVoice event: {event_type}")
@@ -444,7 +441,8 @@ class AmiVoiceSTTService(WebsocketSTTService):
             data = json.loads(payload)
             text = self._extract_text(data)
 
-            if text:
+            # Skip if text is empty or contains only dots (AmiVoice placeholder)
+            if text and text.strip('.'):
                 await self.stop_ttfb_metrics()
                 await self.push_frame(
                     InterimTranscriptionFrame(
