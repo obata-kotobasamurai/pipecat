@@ -64,7 +64,7 @@ class AmiVoiceInputParams(BaseModel):
     """
 
     engine: str = "-a-general"
-    result_updated_interval: int = 300
+    result_updated_interval: int = 500
     output_format: OutputFormat = OutputFormat.WRITTEN
 
 
@@ -387,7 +387,9 @@ class AmiVoiceSTTService(WebsocketSTTService):
             if results:
                 tokens = results[0].get("tokens", [])
                 # Use 'spoken' field if available, fall back to 'written'
-                return "".join(t.get("spoken", t.get("written", "")) for t in tokens)
+                # Filter out '_' (AmiVoice uses '_' as placeholder for punctuation)
+                text = "".join(t.get("spoken", t.get("written", "")) for t in tokens)
+                return text.replace("_", "")
 
         # Default: use 'text' field (written form with kanji)
         return data.get("text", "")
