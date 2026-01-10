@@ -64,7 +64,7 @@ class AmiVoiceInputParams(BaseModel):
     """
 
     engine: str = "-a-general"
-    result_updated_interval: int = 300
+    result_updated_interval: int = 500
     output_format: OutputFormat = OutputFormat.WRITTEN
 
 
@@ -121,6 +121,11 @@ class AmiVoiceSTTService(WebsocketSTTService):
 
         self._receive_task = None
         self._session_active = False
+        self._session_ending = False  # True while waiting for 'e' response
+
+        # Audio buffer for capturing audio before VAD detection
+        self._audio_buffer = bytearray()
+        self._audio_buffer_max_size = 0  # Set in start()
 
     def can_generate_metrics(self) -> bool:
         """Check if the service can generate processing metrics.
@@ -137,6 +142,8 @@ class AmiVoiceSTTService(WebsocketSTTService):
             frame: The start frame containing initialization parameters.
         """
         await super().start(frame)
+        # 1 second of 16-bit mono audio at sample_rate
+        self._audio_buffer_max_size = self.sample_rate * 2
         await self._connect()
 
     async def stop(self, frame: EndFrame):
@@ -196,9 +203,16 @@ class AmiVoiceSTTService(WebsocketSTTService):
         Yields:
             None - transcription results are handled via WebSocket events.
         """
-        if self._websocket and self._websocket.state is State.OPEN and self._session_active:
-            # p command: 'p' prefix + binary audio data
-            await self._websocket.send(b"p" + audio)
+        if self._session_active:
+            if self._websocket and self._websocket.state is State.OPEN:
+                # p command: 'p' prefix + binary audio data
+                await self._websocket.send(b"p" + audio)
+        else:
+            # Buffer audio before VAD detection (keep max ~1 second)
+            self._audio_buffer.extend(audio)
+            if len(self._audio_buffer) > self._audio_buffer_max_size:
+                excess = len(self._audio_buffer) - self._audio_buffer_max_size
+                del self._audio_buffer[:excess]
 
         yield None
 
@@ -245,6 +259,11 @@ class AmiVoiceSTTService(WebsocketSTTService):
 
     async def _start_session(self):
         """Start a new recognition session with s command."""
+        # Don't start new session while previous one is still ending
+        if self._session_ending:
+            logger.debug("Waiting for previous session to end, skipping start")
+            return
+
         if not self._websocket or self._websocket.state is not State.OPEN:
             await self._connect_websocket()
 
@@ -262,12 +281,19 @@ class AmiVoiceSTTService(WebsocketSTTService):
         await self._websocket.send(s_command)
         self._session_active = True
 
+        # Send buffered audio captured before VAD detection
+        if self._audio_buffer:
+            await self._websocket.send(b"p" + bytes(self._audio_buffer))
+            self._audio_buffer.clear()
+
     async def _end_session(self):
         """End the current recognition session with e command."""
         if self._websocket and self._websocket.state is State.OPEN and self._session_active:
             logger.debug("Ending AmiVoice session")
+            self._session_active = False  # Stop audio from being sent
+            self._session_ending = True  # Prevent new session until 'e' response
+            self._audio_buffer.clear()  # Clear buffer for next turn
             await self._websocket.send("e")
-            # Note: _session_active will be set to False when we receive 'e' response
 
     def _get_websocket(self):
         """Get the current WebSocket connection.
@@ -364,6 +390,7 @@ class AmiVoiceSTTService(WebsocketSTTService):
         elif event_type == "e":
             # Session end response
             self._session_active = False
+            self._session_ending = False  # Allow new session to start
             if payload:
                 await self.push_error(error_msg=f"AmiVoice session end error: {payload}")
             else:
@@ -387,7 +414,9 @@ class AmiVoiceSTTService(WebsocketSTTService):
             if results:
                 tokens = results[0].get("tokens", [])
                 # Use 'spoken' field if available, fall back to 'written'
-                return "".join(t.get("spoken", t.get("written", "")) for t in tokens)
+                # Filter out '_' (AmiVoice uses '_' as placeholder for punctuation)
+                text = "".join(t.get("spoken", t.get("written", "")) for t in tokens)
+                return text.replace("_", "")
 
         # Default: use 'text' field (written form with kanji)
         return data.get("text", "")
@@ -412,7 +441,8 @@ class AmiVoiceSTTService(WebsocketSTTService):
             data = json.loads(payload)
             text = self._extract_text(data)
 
-            if text:
+            # Skip if text is empty or contains only dots (AmiVoice placeholder)
+            if text and text.strip('.'):
                 await self.stop_ttfb_metrics()
                 await self.push_frame(
                     InterimTranscriptionFrame(
