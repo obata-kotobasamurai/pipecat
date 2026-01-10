@@ -55,6 +55,7 @@ from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
 from pipecat.observers.loggers.debug_log_observer import DebugLogObserver, FrameEndpoint
 from pipecat.frames.frames import LLMRunFrame, TTSTextFrame
+from pipecat.services.amivoice.stt import AmiVoiceSTTService, AmiVoiceInputParams, OutputFormat
 
 logger.info("✅ All components loaded successfully!")
 
@@ -64,8 +65,15 @@ load_dotenv(override=True)
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info(f"Starting bot")
 
-    stt = SonioxSTTService(
-        api_key=os.getenv("SONIOX_API_KEY"),
+    # stt = SonioxSTTService(
+    #     api_key=os.getenv("SONIOX_API_KEY"),
+    # )
+    # Hiragana output
+    stt = AmiVoiceSTTService(
+        api_key=os.getenv("AMIVOICE_API_KEY"),
+        params=AmiVoiceInputParams(
+            output_format=OutputFormat.SPOKEN,
+        ),
     )
 
     tts = AzureTTSService(
@@ -73,16 +81,15 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         region=os.getenv("AZURE_SPEECH_REGION"),
     )
 
-    llm = OpenRouterLLMService(
-        api_key=os.getenv("OPENROUTER_API_KEY"),
-        model="google/gemini-3-flash-preview",
-        max_completion_tokens=500,
+    llm_aistudio = GoogleLLMService(
+        api_key=os.getenv("GOOGLE_API_KEY"),
+        model="gemini-3-flash-preview",
     )
 
     messages = [
         {
             "role": "system",
-            "content": "You are a friendly AI assistant. Respond naturally and keep your answers conversational.",
+            "content": "You are a friendly AI assistant. Respond naturally and keep your answers conversational. Speak in 日本語",
         },
     ]
 
