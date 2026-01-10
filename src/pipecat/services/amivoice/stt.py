@@ -122,6 +122,10 @@ class AmiVoiceSTTService(WebsocketSTTService):
         self._receive_task = None
         self._session_active = False
 
+        # Audio buffer for capturing audio before VAD detection
+        self._audio_buffer = bytearray()
+        self._audio_buffer_max_size = 0  # Set in start()
+
     def can_generate_metrics(self) -> bool:
         """Check if the service can generate processing metrics.
 
@@ -137,6 +141,8 @@ class AmiVoiceSTTService(WebsocketSTTService):
             frame: The start frame containing initialization parameters.
         """
         await super().start(frame)
+        # 1 second of 16-bit mono audio at sample_rate
+        self._audio_buffer_max_size = self.sample_rate * 2
         await self._connect()
 
     async def stop(self, frame: EndFrame):
@@ -196,9 +202,16 @@ class AmiVoiceSTTService(WebsocketSTTService):
         Yields:
             None - transcription results are handled via WebSocket events.
         """
-        if self._websocket and self._websocket.state is State.OPEN and self._session_active:
-            # p command: 'p' prefix + binary audio data
-            await self._websocket.send(b"p" + audio)
+        if self._session_active:
+            if self._websocket and self._websocket.state is State.OPEN:
+                # p command: 'p' prefix + binary audio data
+                await self._websocket.send(b"p" + audio)
+        else:
+            # Buffer audio before VAD detection (keep max ~1 second)
+            self._audio_buffer.extend(audio)
+            if len(self._audio_buffer) > self._audio_buffer_max_size:
+                excess = len(self._audio_buffer) - self._audio_buffer_max_size
+                del self._audio_buffer[:excess]
 
         yield None
 
@@ -262,11 +275,17 @@ class AmiVoiceSTTService(WebsocketSTTService):
         await self._websocket.send(s_command)
         self._session_active = True
 
+        # Send buffered audio captured before VAD detection
+        if self._audio_buffer:
+            await self._websocket.send(b"p" + bytes(self._audio_buffer))
+            self._audio_buffer.clear()
+
     async def _end_session(self):
         """End the current recognition session with e command."""
         if self._websocket and self._websocket.state is State.OPEN and self._session_active:
             logger.debug("Ending AmiVoice session")
             self._session_active = False  # Set to False BEFORE sending e command
+            self._audio_buffer.clear()  # Clear buffer for next turn
             await self._websocket.send("e")
 
     def _get_websocket(self):
