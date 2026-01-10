@@ -56,6 +56,7 @@ from pipecat.transports.daily.transport import DailyParams
 from pipecat.observers.loggers.debug_log_observer import DebugLogObserver, FrameEndpoint
 from pipecat.frames.frames import LLMRunFrame, TTSTextFrame
 from pipecat.services.amivoice.stt import AmiVoiceSTTService, AmiVoiceInputParams, OutputFormat
+from pipecat.frames.frames import TranscriptionFrame, InterimTranscriptionFrame
 
 logger.info("✅ All components loaded successfully!")
 
@@ -81,9 +82,9 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         region=os.getenv("AZURE_SPEECH_REGION"),
     )
 
-    llm_aistudio = GoogleLLMService(
-        api_key=os.getenv("GOOGLE_API_KEY"),
-        model="gemini-3-flash-preview",
+    llm = OpenRouterLLMService(
+        api_key=os.getenv("OPENROUTER_API_KEY"),
+        model="google/gemini-3-flash-preview",
     )
 
     messages = [
@@ -117,7 +118,11 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             enable_metrics=True,
             enable_usage_metrics=True,
         ),
-        observers=[RTVIObserver(rtvi), DebugLogObserver(frame_types={TTSTextFrame: (BaseOutputTransport, FrameEndpoint.SOURCE)})],
+        observers=[RTVIObserver(rtvi),DebugLogObserver(frame_types=(
+                TranscriptionFrame,
+                InterimTranscriptionFrame
+            ))
+],
     )
 
     @transport.event_handler("on_client_connected")
