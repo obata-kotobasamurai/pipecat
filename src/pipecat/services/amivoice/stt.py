@@ -121,6 +121,7 @@ class AmiVoiceSTTService(WebsocketSTTService):
 
         self._receive_task = None
         self._session_active = False
+        self._session_ending = False  # True while waiting for 'e' response
 
         # Audio buffer for capturing audio before VAD detection
         self._audio_buffer = bytearray()
@@ -258,6 +259,11 @@ class AmiVoiceSTTService(WebsocketSTTService):
 
     async def _start_session(self):
         """Start a new recognition session with s command."""
+        # Don't start new session while previous one is still ending
+        if self._session_ending:
+            logger.debug("Waiting for previous session to end, skipping start")
+            return
+
         if not self._websocket or self._websocket.state is not State.OPEN:
             await self._connect_websocket()
 
@@ -284,7 +290,8 @@ class AmiVoiceSTTService(WebsocketSTTService):
         """End the current recognition session with e command."""
         if self._websocket and self._websocket.state is State.OPEN and self._session_active:
             logger.debug("Ending AmiVoice session")
-            self._session_active = False  # Set to False BEFORE sending e command
+            self._session_active = False  # Stop audio from being sent
+            self._session_ending = True  # Prevent new session until 'e' response
             self._audio_buffer.clear()  # Clear buffer for next turn
             await self._websocket.send("e")
 
@@ -383,10 +390,14 @@ class AmiVoiceSTTService(WebsocketSTTService):
         elif event_type == "e":
             # Session end response
             self._session_active = False
+            self._session_ending = False  # Allow new session to start
             if payload:
                 await self.push_error(error_msg=f"AmiVoice session end error: {payload}")
             else:
                 logger.debug("AmiVoice session ended successfully")
+                # If audio was buffered while session was ending, start new session
+                if self._audio_buffer:
+                    await self._start_session()
 
         else:
             logger.debug(f"Unknown AmiVoice event: {event_type}")
