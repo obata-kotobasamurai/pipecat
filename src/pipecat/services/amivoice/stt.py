@@ -266,8 +266,8 @@ class AmiVoiceSTTService(WebsocketSTTService):
         """End the current recognition session with e command."""
         if self._websocket and self._websocket.state is State.OPEN and self._session_active:
             logger.debug("Ending AmiVoice session")
+            self._session_active = False  # Set to False BEFORE sending e command
             await self._websocket.send("e")
-            # Note: _session_active will be set to False when we receive 'e' response
 
     def _get_websocket(self):
         """Get the current WebSocket connection.
