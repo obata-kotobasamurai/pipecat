@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -38,6 +38,7 @@ from pipecat.frames.frames import (
     LLMContextFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
+    LLMTextFrame,
     StartFrame,
     TranscriptionFrame,
     TTSAudioRawFrame,
@@ -1077,9 +1078,7 @@ class AWSNovaSonicLLMService(LLMService):
         logger.debug(f"Assistant response text added: {text}")
 
         # Report the text of the assistant response.
-        frame = TTSTextFrame(text, aggregated_by=AggregationType.SENTENCE)
-        frame.includes_inter_frame_spaces = True
-        await self.push_frame(frame)
+        await self._push_assistant_response_text_frames(text)
 
         # HACK: here we're also buffering the assistant text ourselves as a
         # backup rather than relying solely on the assistant context aggregator
@@ -1112,11 +1111,7 @@ class AWSNovaSonicLLMService(LLMService):
                 # TTSTextFrame would be ignored otherwise (the interruption frame
                 # would have cleared the assistant aggregator state).
                 await self.push_frame(LLMFullResponseStartFrame())
-                frame = TTSTextFrame(
-                    self._assistant_text_buffer, aggregated_by=AggregationType.SENTENCE
-                )
-                frame.includes_inter_frame_spaces = True
-                await self.push_frame(frame)
+                await self._push_assistant_response_text_frames(self._assistant_text_buffer)
             self._may_need_repush_assistant_text = False
 
         # Report the end of the assistant response.
@@ -1127,6 +1122,25 @@ class AWSNovaSonicLLMService(LLMService):
 
         # Clear out the buffered assistant text
         self._assistant_text_buffer = ""
+
+    async def _push_assistant_response_text_frames(self, text: str):
+        # In a typical "cascade" LLM + TTS setup, LLMTextFrames would not
+        # proceed beyond the TTS service. Therefore, since a speech-to-speech
+        # service like Nova Sonic combines both LLM and TTS functionality, you
+        # would think we wouldn't need to push LLMTextFrames at all. However,
+        # RTVI relies on LLMTextFrames being pushed to trigger its
+        # "bot-llm-text" event. So here we push an LLMTextFrame, too, but avoid
+        # appending it to context to avoid context message duplication.
+
+        # Push LLMTextFrame
+        llm_text_frame = LLMTextFrame(text)
+        llm_text_frame.append_to_context = False
+        await self.push_frame(llm_text_frame)
+
+        # Push TTSTextFrame
+        tts_text_frame = TTSTextFrame(text, aggregated_by=AggregationType.SENTENCE)
+        tts_text_frame.includes_inter_frame_spaces = True
+        await self.push_frame(tts_text_frame)
 
     #
     # user transcription reporting
@@ -1187,7 +1201,7 @@ class AWSNovaSonicLLMService(LLMService):
             logger.debug(
                 "Wrapping assistant response trigger transcription with upstream UserStarted/StoppedSpeakingFrames"
             )
-            await self.push_frame(UserStartedSpeakingFrame(), direction=FrameDirection.UPSTREAM)
+            await self.broadcast_frame(UserStartedSpeakingFrame)
 
         # Send the transcription upstream for the user context aggregator
         frame = TranscriptionFrame(
@@ -1197,7 +1211,7 @@ class AWSNovaSonicLLMService(LLMService):
 
         # Finish wrapping the upstream transcription in UserStarted/StoppedSpeakingFrames if needed
         if should_wrap_in_user_started_stopped_speaking_frames:
-            await self.push_frame(UserStoppedSpeakingFrame(), direction=FrameDirection.UPSTREAM)
+            await self.broadcast_frame(UserStoppedSpeakingFrame)
 
         # Clear out the buffered user text
         self._user_text_buffer = ""

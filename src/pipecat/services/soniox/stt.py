@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -264,6 +264,8 @@ class SonioxSTTService(WebsocketSTTService):
 
         Establishes websocket connection and starts receive and keepalive tasks.
         """
+        await super()._connect()
+
         await self._connect_websocket()
 
         if self._websocket and not self._receive_task:
@@ -277,6 +279,8 @@ class SonioxSTTService(WebsocketSTTService):
 
         Cleans up tasks and closes websocket connection.
         """
+        await super()._disconnect()
+
         if self._keepalive_task:
             await self.cancel_task(self._keepalive_task)
             self._keepalive_task = None

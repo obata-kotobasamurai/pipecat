@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024-2025 Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -15,7 +15,7 @@ from pipecat.frames.frames import (
     FunctionCallsStartedFrame,
     InterruptionFrame,
 )
-from pipecat.turns.mute import (
+from pipecat.turns.user_mute import (
     AlwaysUserMuteStrategy,
     FirstSpeechUserMuteStrategy,
     FunctionCallUserMuteStrategy,

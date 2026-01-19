@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -101,6 +101,9 @@ class TTSService(AIService):
         silence_time_s: float = 2.0,
         # if True, we will pause processing frames while we are receiving audio
         pause_frame_processing: bool = False,
+        # if True, append a trailing space to text before sending to TTS
+        # (helps prevent some TTS services from vocalizing trailing punctuation)
+        append_trailing_space: bool = False,
         # TTS output sample rate
         sample_rate: Optional[int] = None,
         # Text aggregator to aggregate incoming tokens and decide when to push to the TTS.
@@ -132,6 +135,8 @@ class TTSService(AIService):
             push_silence_after_stop: Whether to push silence audio after TTSStoppedFrame.
             silence_time_s: Duration of silence to push when push_silence_after_stop is True.
             pause_frame_processing: Whether to pause frame processing during audio generation.
+            append_trailing_space: Whether to append a trailing space to text before sending to TTS.
+                This helps prevent some TTS services from vocalizing trailing punctuation (e.g., "dot").
             sample_rate: Output sample rate for generated audio.
             text_aggregator: Custom text aggregator for processing incoming text.
 
@@ -161,6 +166,7 @@ class TTSService(AIService):
         self._push_silence_after_stop: bool = push_silence_after_stop
         self._silence_time_s: float = silence_time_s
         self._pause_frame_processing: bool = pause_frame_processing
+        self._append_trailing_space: bool = append_trailing_space
         self._init_sample_rate = sample_rate
         self._sample_rate = 0
         self._voice_id: str = ""
@@ -272,6 +278,19 @@ class TTSService(AIService):
             The service-specific language identifier, or None if not supported.
         """
         return Language(language)
+
+    def _prepare_text_for_tts(self, text: str) -> str:
+        """Prepare text for TTS by applying any transformations required by the TTS service.
+
+        Args:
+            text: The text to prepare.
+
+        Returns:
+            The prepared text with transformations applied.
+        """
+        if self._append_trailing_space and not text.endswith(" "):
+            return text + " "
+        return text
 
     async def update_setting(self, key: str, value: Any):
         """Update a service-specific setting.
@@ -603,7 +622,10 @@ class TTSService(AIService):
         for aggregation_type, transform in self._text_transforms:
             if aggregation_type == type or aggregation_type == "*":
                 transformed_text = await transform(transformed_text, type)
-        await self.process_generator(self.run_tts(transformed_text))
+
+        # Apply any final text preparation (e.g., trailing space)
+        prepared_text = self._prepare_text_for_tts(transformed_text)
+        await self.process_generator(self.run_tts(prepared_text))
 
         await self.stop_processing_metrics()
 
@@ -905,7 +927,7 @@ class InterruptibleWordTTSService(WebsocketWordTTSService):
             self._bot_speaking = False
 
 
-class AudioContextTTSService(WebsocketService):
+class AudioContextTTSService(WebsocketTTSService):
     """Base class for websocket-based TTS services with audio context management.
 
     This is a base class for websocket-based TTS services that allow correlating
@@ -925,7 +947,7 @@ class AudioContextTTSService(WebsocketService):
 
         Args:
             reconnect_on_error: Whether to automatically reconnect on websocket errors.
-            **kwargs: Additional arguments passed to the parent WebsocketService.
+            **kwargs: Additional arguments passed to the parent WebsocketTTSService.
         """
         super().__init__(reconnect_on_error=reconnect_on_error, **kwargs)
         self._contexts: Dict[str, asyncio.Queue] = {}
@@ -1081,10 +1103,12 @@ class AudioContextWordTTSService(AudioContextTTSService, WebsocketWordTTSService
     with the word timestamp functionality of WebsocketWordTTSService.
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, *, reconnect_on_error: bool = True, **kwargs):
         """Initialize the Audio Context Word TTS service.
 
         Args:
+            reconnect_on_error: Whether to automatically reconnect on websocket errors.
             **kwargs: Additional arguments passed to parent classes.
         """
-        super().__init__(**kwargs)
+        AudioContextTTSService.__init__(self, reconnect_on_error=reconnect_on_error, **kwargs)
+        WebsocketWordTTSService.__init__(self, reconnect_on_error=reconnect_on_error, **kwargs)
