@@ -82,7 +82,7 @@ class LLMUserAggregatorParams:
         user_turn_stop_timeout: Time in seconds to wait before considering the
             user's turn finished.
         user_idle_timeout: Optional timeout in seconds for detecting user idle state.
-            If set, the aggregator will emit an `on_user_idle` event when the user
+            If set, the aggregator will emit an `on_user_turn_idle` event when the user
             has been idle (not speaking) for this duration. Set to None to disable
             idle detection.
     """
@@ -297,7 +297,9 @@ class LLMUserAggregator(LLMContextAggregator):
     - on_user_turn_started: Called when the user turn starts
     - on_user_turn_stopped: Called when the user turn ends
     - on_user_turn_stop_timeout: Called when no user turn stop strategy triggers
-    - on_user_idle: Called when the user has been idle for the configured timeout
+    - on_user_turn_idle: Called when the user has been idle for the configured timeout
+    - on_user_mute_started: Called when the user becomes muted
+    - on_user_mute_stopped: Called when the user becomes unmuted
 
     Example::
 
@@ -313,8 +315,16 @@ class LLMUserAggregator(LLMContextAggregator):
         async def on_user_turn_stop_timeout(aggregator):
             ...
 
-        @aggregator.event_handler("on_user_idle")
-        async def on_user_idle(aggregator):
+        @aggregator.event_handler("on_user_turn_idle")
+        async def on_user_turn_idle(aggregator):
+            ...
+
+        @aggregator.event_handler("on_user_mute_started")
+        async def on_user_mute_started(aggregator):
+            ...
+
+        @aggregator.event_handler("on_user_mute_stopped")
+        async def on_user_mute_stopped(aggregator):
             ...
 
     """
@@ -339,7 +349,9 @@ class LLMUserAggregator(LLMContextAggregator):
         self._register_event_handler("on_user_turn_started")
         self._register_event_handler("on_user_turn_stopped")
         self._register_event_handler("on_user_turn_stop_timeout")
-        self._register_event_handler("on_user_idle")
+        self._register_event_handler("on_user_turn_idle")
+        self._register_event_handler("on_user_mute_started")
+        self._register_event_handler("on_user_mute_stopped")
 
         user_turn_strategies = self._params.user_turn_strategies or UserTurnStrategies()
 
@@ -368,7 +380,9 @@ class LLMUserAggregator(LLMContextAggregator):
             self._user_idle_controller = UserIdleController(
                 user_idle_timeout=self._params.user_idle_timeout
             )
-            self._user_idle_controller.add_event_handler("on_user_idle", self._on_user_idle)
+            self._user_idle_controller.add_event_handler(
+                "on_user_turn_idle", self._on_user_turn_idle
+            )
 
     async def cleanup(self):
         """Clean up processor resources."""
@@ -490,6 +504,12 @@ class LLMUserAggregator(LLMContextAggregator):
             logger.debug(f"{self}: user is now {'muted' if should_mute_next_time else 'unmuted'}")
             self._user_is_muted = should_mute_next_time
 
+            # Emit mute state change events
+            if self._user_is_muted:
+                await self._call_event_handler("on_user_mute_started")
+            else:
+                await self._call_event_handler("on_user_mute_stopped")
+
         return should_mute_frame
 
     async def _handle_llm_run(self, frame: LLMRunFrame):
@@ -594,8 +614,8 @@ class LLMUserAggregator(LLMContextAggregator):
     async def _on_user_turn_stop_timeout(self, controller):
         await self._call_event_handler("on_user_turn_stop_timeout")
 
-    async def _on_user_idle(self, controller):
-        await self._call_event_handler("on_user_idle")
+    async def _on_user_turn_idle(self, controller):
+        await self._call_event_handler("on_user_turn_idle")
 
 
 class LLMAssistantAggregator(LLMContextAggregator):
@@ -890,10 +910,8 @@ class LLMAssistantAggregator(LLMContextAggregator):
         logger.debug(
             f"{self} FunctionCallCancelFrame: [{frame.function_name}:{frame.tool_call_id}]"
         )
-        if frame.tool_call_id not in self._function_calls_in_progress:
-            return
-
-        if self._function_calls_in_progress[frame.tool_call_id].cancel_on_interruption:
+        function_call = self._function_calls_in_progress.get(frame.tool_call_id)
+        if function_call and function_call.cancel_on_interruption:
             # Update context with the function call cancellation
             self._update_function_call_result(frame.function_name, frame.tool_call_id, "CANCELLED")
             del self._function_calls_in_progress[frame.tool_call_id]
