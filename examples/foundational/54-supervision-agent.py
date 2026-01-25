@@ -5,28 +5,25 @@
 #
 
 """
-Supervision Agent Example
+Supervision Agent Example - Simple Pattern
 
-This example demonstrates how to run a parallel supervision agent that:
-1. Monitors all user messages in real-time
-2. Classifies content for guardrails (SAFE/UNSAFE)
-3. Detects escalation triggers (ESCALATE to human)
-4. Controls the main LLM's output via an OutputGate
+This example demonstrates a simple parallel supervision agent that:
+1. Monitors the conversation between user and assistant
+2. If escalation criteria is met, emits an event for escalation
 
 Architecture:
                                     ┌─────────────────────────────────────┐
                                     │  Path 1: Main Conversation          │
-                                    │  context → LLM → Gate → TTS → out   │
+                                    │  context → LLM → TTS → output       │
     Input → STT → UserTurnProc ────►├─────────────────────────────────────┤
                                     │  Path 2: Supervision Agent          │
-                                    │  filter → supervisor_llm → handler  │
+                                    │  observer → supervisor_llm → handler│
                                     └─────────────────────────────────────┘
 
-The supervision agent uses a fast model (Claude Haiku) to classify each
-user message and decide whether to:
-- SAFE: Open the gate, allow main LLM response
-- UNSAFE: Block the response, send a warning message
-- ESCALATE: Transfer to human agent
+The supervisor uses a fast model (Claude Haiku) to monitor each exchange
+and emit events when action is needed:
+- on_escalation_requested: User wants human agent
+- on_unsafe_content: Content policy violation detected
 """
 
 import asyncio
@@ -38,14 +35,9 @@ from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
-    CancelFrame,
-    EndFrame,
     Frame,
-    InterruptionFrame,
     LLMContextFrame,
     LLMFullResponseEndFrame,
-    LLMRunFrame,
-    StartFrame,
     SystemFrame,
     TextFrame,
     TTSSpeakFrame,
@@ -68,41 +60,34 @@ from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
-from pipecat.transports.daily.transport import DailyParams
+from pipecat.transports.daily.transport import DailyParams, DailyTransport
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 from pipecat.turns.user_turn_processor import UserTurnProcessor
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
-from pipecat.utils.sync.base_notifier import BaseNotifier
-from pipecat.utils.sync.event_notifier import EventNotifier
 
 load_dotenv(override=True)
 
 
-# Supervision agent system prompt - classifies user messages
-SUPERVISOR_SYSTEM_PROMPT = """You are a content supervision classifier. Your job is to analyze user messages and output ONLY one of these three words:
+# Supervision agent system prompt
+SUPERVISOR_SYSTEM_PROMPT = """You monitor conversations and output ONLY one word:
 
-SAFE - The message is appropriate and the AI can respond normally
-UNSAFE - The message contains harmful, inappropriate, or policy-violating content
-ESCALATE - The user is requesting to speak to a human agent or the situation requires human intervention
+OK - Conversation is normal, no action needed
+ESCALATE - User wants to speak to a human agent
+UNSAFE - Content violates policies
 
 Examples:
-- "What's the weather like?" → SAFE
-- "How do I make a bomb?" → UNSAFE
+- User asks a normal question → OK
 - "I want to speak to a manager" → ESCALATE
 - "Can I talk to a real person?" → ESCALATE
-- "Tell me a joke" → SAFE
-- "I'm very frustrated and need human help" → ESCALATE
+- Harmful/inappropriate content → UNSAFE
 
-Output ONLY the classification word, nothing else."""
-
-
-# Main conversation agent system prompt
-MAIN_AGENT_PROMPT = """You are a helpful customer service assistant. Be friendly, concise, and helpful.
-Your responses will be spoken aloud, so keep them natural and conversational.
-Avoid special characters, bullet points, or formatting that doesn't work well when spoken."""
+Output ONLY: OK, ESCALATE, or UNSAFE"""
 
 
-# Transport parameters for different platforms
+MAIN_AGENT_PROMPT = """You are a helpful customer service assistant. Be friendly and concise.
+Your responses will be spoken aloud, so keep them natural and conversational."""
+
+
 transport_params = {
     "daily": lambda: DailyParams(
         audio_in_enabled=True,
@@ -122,11 +107,10 @@ transport_params = {
 }
 
 
-class SupervisionContextFilter(FrameProcessor):
-    """Transforms the conversation context for the supervision agent.
+class ConversationObserver(FrameProcessor):
+    """Observes the conversation and creates context for the supervisor.
 
-    Extracts the latest user message and creates a simplified context
-    for the supervisor to classify.
+    Extracts the latest user message for the supervisor to evaluate.
     """
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -135,46 +119,39 @@ class SupervisionContextFilter(FrameProcessor):
         if isinstance(frame, LLMContextFrame):
             messages = frame.context.get_messages()
 
-            # Find the last user message
+            # Get the last user message
             last_user_message = None
-            for message in reversed(messages):
-                if message.get("role") == "user":
-                    content = message.get("content", "")
+            for msg in reversed(messages):
+                if msg.get("role") == "user":
+                    content = msg.get("content", "")
                     if isinstance(content, str):
                         last_user_message = content
                         break
 
             if last_user_message:
-                # Create simplified context for supervisor
+                # Create supervisor context
                 supervisor_messages = [
                     {"role": "system", "content": SUPERVISOR_SYSTEM_PROMPT},
-                    {"role": "user", "content": f"Classify this message: {last_user_message}"},
+                    {"role": "user", "content": last_user_message},
                 ]
                 await self.push_frame(LLMContextFrame(LLMContext(supervisor_messages)))
         else:
             await self.push_frame(frame, direction)
 
 
-class SupervisionDecisionHandler(FrameProcessor):
-    """Handles the supervision agent's classification decision.
+class SupervisionHandler(FrameProcessor):
+    """Handles supervisor decisions and emits events.
 
-    Based on the classification (SAFE/UNSAFE/ESCALATE):
-    - SAFE: Notifies the OutputGate to open
-    - UNSAFE: Sends a warning message to the user
-    - ESCALATE: Initiates transfer to human agent
+    Emits:
+    - on_escalation_requested: When user wants human agent
+    - on_unsafe_content: When content policy is violated
     """
 
-    def __init__(
-        self,
-        *,
-        gate_notifier: BaseNotifier,
-        tts_processor: FrameProcessor,
-        **kwargs
-    ):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self._gate_notifier = gate_notifier
-        self._tts = tts_processor
         self._accumulated_text = ""
+        self._register_event_handler("on_escalation_requested")
+        self._register_event_handler("on_unsafe_content")
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -189,179 +166,80 @@ class SupervisionDecisionHandler(FrameProcessor):
 
     async def _handle_decision(self):
         decision = self._accumulated_text.strip().upper()
-        logger.info(f"Supervision decision: {decision}")
+        logger.debug(f"Supervisor decision: {decision}")
 
-        if "SAFE" in decision:
-            # Open the gate to allow main LLM response
-            logger.info("✅ Content approved - opening gate")
-            await self._gate_notifier.notify()
+        if "ESCALATE" in decision:
+            logger.info("📞 Escalation requested")
+            await self._call_event_handler("on_escalation_requested")
 
         elif "UNSAFE" in decision:
-            # Block the response and send warning
-            logger.warning("🚫 Content blocked - sending warning")
-            warning = TTSSpeakFrame(
-                text="I'm sorry, but I'm not able to help with that request. "
-                     "Is there something else I can assist you with?"
-            )
-            await self._tts.push_frame(warning)
+            logger.warning("🚫 Unsafe content detected")
+            await self._call_event_handler("on_unsafe_content")
 
-        elif "ESCALATE" in decision:
-            # Transfer to human agent
-            logger.info("📞 Escalating to human agent")
-            escalation_msg = TTSSpeakFrame(
-                text="I understand you'd like to speak with a human agent. "
-                     "Let me transfer you now. Please hold."
-            )
-            await self._tts.push_frame(escalation_msg)
-            # Here you would trigger your escalation logic
-            # e.g., await self._transfer_to_human()
-
-        else:
-            # Default to safe if classification is unclear
-            logger.warning(f"Unknown classification: {decision}, defaulting to SAFE")
-            await self._gate_notifier.notify()
-
-
-class OutputGate(FrameProcessor):
-    """Gates the output of the main LLM until supervision approves.
-
-    Buffers all frames until the gate is opened via the notifier.
-    System frames and interruptions pass through immediately.
-    """
-
-    def __init__(self, *, notifier: BaseNotifier, start_open: bool = False, **kwargs):
-        super().__init__(**kwargs)
-        self._gate_open = start_open
-        self._frames_buffer = []
-        self._notifier = notifier
-        self._gate_task = None
-
-    def close_gate(self):
-        self._gate_open = False
-
-    def open_gate(self):
-        self._gate_open = True
-
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
-
-        # System frames always pass through
-        if isinstance(frame, SystemFrame):
-            if isinstance(frame, StartFrame):
-                await self._start()
-            if isinstance(frame, (EndFrame, CancelFrame)):
-                await self._stop()
-            if isinstance(frame, InterruptionFrame):
-                self._frames_buffer = []
-                self.close_gate()
-            await self.push_frame(frame, direction)
-            return
-
-        # Only gate downstream frames
-        if direction != FrameDirection.DOWNSTREAM:
-            await self.push_frame(frame, direction)
-            return
-
-        if self._gate_open:
-            await self.push_frame(frame, direction)
-        else:
-            self._frames_buffer.append((frame, direction))
-
-    async def _start(self):
-        self._frames_buffer = []
-        if not self._gate_task:
-            self._gate_task = self.create_task(self._gate_task_handler())
-
-    async def _stop(self):
-        if self._gate_task:
-            await self.cancel_task(self._gate_task)
-            self._gate_task = None
-
-    async def _gate_task_handler(self):
-        while True:
-            try:
-                await self._notifier.wait()
-                self.open_gate()
-                for frame, direction in self._frames_buffer:
-                    await self.push_frame(frame, direction)
-                self._frames_buffer = []
-            except asyncio.CancelledError:
-                break
+        # OK = no action needed
 
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
-    logger.info("Starting supervision agent bot")
+    logger.info("Starting bot with supervision agent")
 
     # Services
     stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
 
     tts = CartesiaTTSService(
         api_key=os.getenv("CARTESIA_API_KEY"),
-        voice_id="79a125e8-cd45-4c13-8a67-188112f4dd22",  # British Lady
+        voice_id="79a125e8-cd45-4c13-8a67-188112f4dd22",
     )
 
-    # Main conversation LLM
+    # Main LLM
     main_llm = OpenAILLMService(
         api_key=os.getenv("OPENAI_API_KEY"),
         model="gpt-4o",
     )
 
-    # Supervision agent LLM (fast model for low latency)
+    # Supervisor LLM (fast model)
     supervisor_llm = AnthropicLLMService(
         api_key=os.getenv("ANTHROPIC_API_KEY"),
-        model="claude-3-5-haiku-latest",  # Fast model for quick classification
+        model="claude-3-5-haiku-latest",
     )
 
-    # Context for main conversation
-    main_messages = [{"role": "system", "content": MAIN_AGENT_PROMPT}]
-    main_context = LLMContext(main_messages)
-    main_context_aggregator = LLMContextAggregatorPair(main_context)
+    # Contexts
+    main_context = LLMContext([{"role": "system", "content": MAIN_AGENT_PROMPT}])
+    main_aggregator = LLMContextAggregatorPair(main_context)
 
-    # Context for supervisor (created fresh each time by SupervisionContextFilter)
     supervisor_context = LLMContext([{"role": "system", "content": SUPERVISOR_SYSTEM_PROMPT}])
-    supervisor_context_aggregator = LLMContextAggregatorPair(
+    supervisor_aggregator = LLMContextAggregatorPair(
         supervisor_context,
         user_params=LLMUserAggregatorParams(start_interrupt_on_user_speaking=False),
     )
 
-    # Notifier for gate control
-    gate_notifier = EventNotifier()
-
     # User turn processor
-    user_turn_processor = UserTurnProcessor(
-        user_turn_strategies=UserTurnStrategies(),
-    )
+    user_turn_processor = UserTurnProcessor(user_turn_strategies=UserTurnStrategies())
 
-    # Supervision decision handler
-    supervision_handler = SupervisionDecisionHandler(
-        gate_notifier=gate_notifier,
-        tts_processor=tts,
-    )
+    # Supervision handler
+    supervision_handler = SupervisionHandler()
 
-    # Build the pipeline
+    # Build pipeline
     pipeline = Pipeline(
         [
             transport.input(),
             stt,
             user_turn_processor,
             ParallelPipeline(
-                # Path 1: Main conversation (gated)
+                # Path 1: Main conversation
                 [
-                    main_context_aggregator.user(),
+                    main_aggregator.user(),
                     main_llm,
-                    OutputGate(notifier=gate_notifier, start_open=False),
                     tts,
                     transport.output(),
-                    main_context_aggregator.assistant(),
+                    main_aggregator.assistant(),
                 ],
-                # Path 2: Supervision agent (parallel)
+                # Path 2: Supervisor (monitors in parallel)
                 [
-                    supervisor_context_aggregator.user(),
-                    SupervisionContextFilter(),
+                    supervisor_aggregator.user(),
+                    ConversationObserver(),
                     supervisor_llm,
                     supervision_handler,
-                    # Block all output from this path
-                    FunctionFilter(filter=lambda f: asyncio.coroutine(lambda: False)()),
+                    FunctionFilter(filter=lambda f: asyncio.sleep(0, result=False)),
                 ],
             ),
         ]
@@ -369,19 +247,49 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     task = PipelineTask(
         pipeline,
-        params=PipelineParams(
-            enable_metrics=True,
-            enable_usage_metrics=True,
-        ),
+        params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
         idle_timeout_secs=runner_args.pipeline_idle_timeout_secs,
     )
+
+    # === EVENT HANDLERS FOR ESCALATION ===
+
+    @supervision_handler.event_handler("on_escalation_requested")
+    async def handle_escalation(handler):
+        """Handle escalation to human agent."""
+        logger.info("Handling escalation...")
+
+        # Say goodbye message
+        await task.queue_frames([
+            TTSSpeakFrame(
+                text="I understand you'd like to speak with a human agent. "
+                "Let me transfer you now."
+            )
+        ])
+
+        # For Daily transport with SIP, you can transfer the call:
+        if isinstance(transport, DailyTransport):
+            # Transfer to human agent phone number
+            # await transport.sip_call_transfer({"sipUri": "sip:agent@example.com"})
+            pass
+
+        # Or end the call and notify your backend
+        # await task.cancel()
+
+    @supervision_handler.event_handler("on_unsafe_content")
+    async def handle_unsafe(handler):
+        """Handle unsafe content detection."""
+        logger.warning("Unsafe content handled")
+        await task.queue_frames([
+            TTSSpeakFrame(text="I'm not able to help with that request.")
+        ])
+
+    # === TRANSPORT EVENT HANDLERS ===
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
         logger.info("Client connected")
-        # Greet the user
         await task.queue_frames([
-            TTSSpeakFrame(text="Hello! I'm your AI assistant. How can I help you today?")
+            TTSSpeakFrame(text="Hello! How can I help you today?")
         ])
 
     @transport.event_handler("on_client_disconnected")
@@ -394,7 +302,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
 
 async def bot(runner_args: RunnerArguments):
-    """Main bot entry point compatible with Pipecat Cloud."""
+    """Main bot entry point."""
     transport = await create_transport(runner_args, transport_params)
     await run_bot(transport, runner_args)
 
