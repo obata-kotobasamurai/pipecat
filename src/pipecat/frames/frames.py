@@ -1848,6 +1848,22 @@ class TTSStoppedFrame(ControlFrame):
 
 
 @dataclass
+class TTSErrorFrame(ErrorFrame):
+    """Error frame emitted when TTS synthesis fails.
+
+    Carries the original text so that application code can retry or
+    re-dispatch the failed synthesis to another service.
+
+    Parameters:
+        text: The text that failed to synthesize.
+        tts_context_id: The context ID of the failed synthesis.
+    """
+
+    text: str = ""
+    tts_context_id: Optional[str] = None
+
+
+@dataclass
 class ServiceUpdateSettingsFrame(ControlFrame, UninterruptibleFrame):
     """Base frame for updating service settings.
 
