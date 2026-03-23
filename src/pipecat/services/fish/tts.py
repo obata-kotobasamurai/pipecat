@@ -24,6 +24,7 @@ from pipecat.frames.frames import (
     Frame,
     StartFrame,
     TTSAudioRawFrame,
+    TTSErrorFrame,
     TTSStoppedFrame,
 )
 from pipecat.services.settings import NOT_GIVEN, TTSSettings, _NotGiven, assert_given
@@ -194,6 +195,7 @@ class FishAudioTTSService(InterruptibleTTSService):
         self._base_url = "wss://api.fish.audio/v1/tts/live"
         self._websocket = None
         self._receive_task = None
+        self._tts_text_by_context: dict[str, str] = {}
 
         # Init-only audio format config (not runtime-updatable).
         self._fish_sample_rate = 0  # Set in start()
@@ -364,15 +366,34 @@ class FishAudioTTSService(InterruptibleTTSService):
                                 await self.stop_ttfb_metrics()
                         elif event == "finish":
                             reason = msg.get("reason", "unknown")
+                            context_id = self.get_active_audio_context_id()
                             if reason == "error":
-                                await self.push_error(
-                                    error_msg="Fish Audio server error during synthesis"
+                                text = (
+                                    self._tts_text_by_context.get(context_id, "")
+                                    if context_id
+                                    else ""
                                 )
+                                error_frame = TTSErrorFrame(
+                                    error="Fish Audio server error during synthesis",
+                                    text=text,
+                                    tts_context_id=context_id,
+                                )
+                                await self.push_error_frame(error_frame)
                             else:
+                                if context_id:
+                                    self._tts_text_by_context.pop(context_id, None)
                                 logger.debug(f"Fish Audio session finished: {reason}")
 
             except Exception as e:
-                await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
+                context_id = self.get_active_audio_context_id()
+                text = self._tts_text_by_context.get(context_id, "") if context_id else ""
+                error_frame = TTSErrorFrame(
+                    error=f"Unknown error occurred: {e}",
+                    exception=e,
+                    text=text,
+                    tts_context_id=context_id,
+                )
+                await self.push_error_frame(error_frame)
 
     @traced_tts
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame | None, None]:
@@ -386,6 +407,7 @@ class FishAudioTTSService(InterruptibleTTSService):
             Frame: Audio frames and control frames for the synthesized speech.
         """
         logger.debug(f"{self}: Generating Fish TTS: [{text}]")
+        self._tts_text_by_context[context_id] = text
         try:
             if not self._websocket or self._websocket.state is State.CLOSED:
                 await self._connect()
