@@ -399,6 +399,7 @@ class AggregatedTextFrame(TextFrame):
     aggregated_by: AggregationType | str
     context_id: str | None = None
     raw_text: str | None = None
+    retry_group_id: str | None = None
     will_be_spoken: bool = field(default=False, init=False)
 
 
@@ -798,10 +799,14 @@ class TTSSpeakFrame(DataFrame):
         append_to_context: Whether the spoken text should be appended to the LLM
             context. Defaults to True. (Note that, as of version 1.4.0, ``None`` —
             the previous default — is no longer a supported value.)
+        retry_group_id: Optional stable identifier used by application-level
+            retry/failover logic to track a single utterance across TTS
+            context changes. Propagated onto any resulting ``TTSErrorFrame``.
     """
 
     text: str
     append_to_context: bool = True
+    retry_group_id: str | None = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -2075,6 +2080,26 @@ class TTSStoppedFrame(ControlFrame):
     """
 
     context_id: str | None = None
+
+
+@dataclass
+class TTSErrorFrame(ErrorFrame):
+    """Error frame emitted when TTS synthesis fails.
+
+    Carries the original text so that application code can retry or
+    re-dispatch the failed synthesis to another service.
+
+    Parameters:
+        text: The text that failed to synthesize.
+        tts_context_id: The context ID of the failed synthesis.
+        retry_group_id: Optional stable identifier carried over from the
+            originating ``TTSSpeakFrame`` so retry/failover logic can track the
+            utterance across TTS context changes.
+    """
+
+    text: str = ""
+    tts_context_id: Optional[str] = None
+    retry_group_id: Optional[str] = None
 
 
 @dataclass

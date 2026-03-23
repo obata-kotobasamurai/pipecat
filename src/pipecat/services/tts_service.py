@@ -39,6 +39,7 @@ from pipecat.frames.frames import (
     TextFrame,
     TranscriptionFrame,
     TTSAudioRawFrame,
+    TTSErrorFrame,
     TTSSpeakFrame,
     TTSStartedFrame,
     TTSStoppedFrame,
@@ -771,7 +772,12 @@ class TTSService(AIService):
             push_assistant_aggregation = frame.append_to_context and not self._llm_response_started
             # Assumption: text in TTSSpeakFrame does not include inter-frame spaces
             await self._push_tts_frames(
-                AggregatedTextFrame(frame.text, AggregationType.SENTENCE, raw_text=frame.text),
+                AggregatedTextFrame(
+                    frame.text,
+                    AggregationType.SENTENCE,
+                    raw_text=frame.text,
+                    retry_group_id=frame.retry_group_id,
+                ),
                 append_tts_text_to_context=frame.append_to_context,
                 push_assistant_aggregation=push_assistant_aggregation,
             )
@@ -1119,7 +1125,12 @@ class TTSService(AIService):
             append_to_context=self._tts_contexts[context_id].append_to_context,
         )
 
-        await self.tts_process_generator(context_id, self.run_tts(prepared_text, context_id))
+        await self.tts_process_generator(
+            context_id,
+            self.run_tts(prepared_text, context_id),
+            text,
+            retry_group_id=getattr(src_frame, "retry_group_id", None),
+        )
 
         if not self._is_streaming_tokens:
             await self.stop_processing_metrics()
@@ -1145,7 +1156,11 @@ class TTSService(AIService):
                 await self.push_frame(f)
 
     async def tts_process_generator(
-        self, context_id: str, generator: AsyncGenerator[Frame | None, None]
+        self,
+        context_id: str,
+        generator: AsyncGenerator[Frame | None, None],
+        original_text: str = "",
+        retry_group_id: str | None = None,
     ) -> bool:
         """Process frames from an async generator, routing them through the audio context.
 
@@ -1159,14 +1174,32 @@ class TTSService(AIService):
         remove_audio_context in run_tts — the caller (_synthesize_text) closes the context
         after appending any remaining frames (e.g. TTSTextFrame).
 
+        When ``original_text`` is provided and the generator yields an
+        ``ErrorFrame``, it is promoted to a ``TTSErrorFrame`` carrying the
+        original text so that application code can retry the synthesis.
+
         Args:
             context_id: The audio context to route frames to.
             generator: An async generator yielding Frame objects or None.
+            original_text: The original text sent to TTS. Used to populate
+                ``TTSErrorFrame.text`` on errors.
+            retry_group_id: Optional stable utterance id propagated onto any
+                promoted ``TTSErrorFrame`` for application-level retry tracking.
 
         """
         is_yielding_frames = False
         async for frame in generator:
             if frame:
+                if isinstance(frame, ErrorFrame) and not isinstance(frame, TTSErrorFrame):
+                    frame = TTSErrorFrame(
+                        error=frame.error,
+                        fatal=frame.fatal,
+                        processor=frame.processor,
+                        exception=frame.exception,
+                        text=original_text,
+                        tts_context_id=context_id,
+                        retry_group_id=retry_group_id,
+                    )
                 await self.append_to_audio_context(context_id, frame)
                 if isinstance(frame, TTSAudioRawFrame):
                     is_yielding_frames = True
