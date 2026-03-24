@@ -419,6 +419,16 @@ class FishAudioTTSService(InterruptibleTTSService):
                                     tts_context_id=context_id,
                                 )
                                 await self.push_error_frame(error_frame)
+                                if context_id:
+                                    self._tts_text_by_context.pop(context_id, None)
+                                    # Close the failed audio context immediately so
+                                    # queued retries/failover contexts are not blocked
+                                    # behind the 3s audio-context timeout.
+                                    await self.append_to_audio_context(
+                                        context_id,
+                                        TTSStoppedFrame(context_id=context_id),
+                                    )
+                                    await self.remove_audio_context(context_id)
                             else:
                                 if context_id:
                                     self._tts_text_by_context.pop(context_id, None)
@@ -434,6 +444,13 @@ class FishAudioTTSService(InterruptibleTTSService):
                     tts_context_id=context_id,
                 )
                 await self.push_error_frame(error_frame)
+                if context_id:
+                    self._tts_text_by_context.pop(context_id, None)
+                    await self.append_to_audio_context(
+                        context_id,
+                        TTSStoppedFrame(context_id=context_id),
+                    )
+                    await self.remove_audio_context(context_id)
 
     @traced_tts
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame | None, None]:
