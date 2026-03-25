@@ -323,6 +323,8 @@ class TTSService(AIService):
         # finishes playing. Merging them would null out the playback cursor prematurely.
         self._playing_context_id: str | None = None
         self._turn_context_id: str | None = None
+        self._pending_retry_group_id: str | None = None
+        self._retry_group_by_context: dict[str, str] = {}
         self._audio_contexts: dict[str, asyncio.Queue] = {}
         self._audio_context_task: asyncio.Task | None = None
 
@@ -706,25 +708,30 @@ class TTSService(AIService):
             # TTSSpeakFrame is independent — temporarily clear the turn context
             # so create_context_id() generates a fresh UUID for this utterance.
             saved_turn_context_id = self._turn_context_id
+            saved_pending_retry_group_id = self._pending_retry_group_id
             self._turn_context_id = None
-            # Creating a new context_id for the TTS request.
-            self._turn_context_id = self.create_context_id()
-            await self.on_turn_context_created(self._turn_context_id)
-            # If we are not receiving text from the LLM, we can assume that the SpeakFrame should be automatically added to the context
-            push_assistant_aggregation = frame.append_to_context and not self._llm_response_started
-            # Assumption: text in TTSSpeakFrame does not include inter-frame spaces
-            await self._push_tts_frames(
-                AggregatedTextFrame(frame.text, AggregationType.SENTENCE),
-                append_tts_text_to_context=frame.append_to_context,
-                push_assistant_aggregation=push_assistant_aggregation,
-            )
-            await self.on_turn_context_completed()
-            # We pause processing incoming frames because we are sending data to
-            # the TTS. We pause to avoid audio overlapping.
-            await self._maybe_pause_frame_processing()
-            self._turn_context_id = saved_turn_context_id
-            self._sent_non_whitespace_in_context = saved_sent_non_whitespace
-            self._processing_text = processing_text
+            try:
+                # Creating a new context_id for the TTS request.
+                self._turn_context_id = self.create_context_id()
+                await self.on_turn_context_created(self._turn_context_id)
+                self._pending_retry_group_id = frame.retry_group_id
+                # If we are not receiving text from the LLM, we can assume that the SpeakFrame should be automatically added to the context
+                push_assistant_aggregation = frame.append_to_context and not self._llm_response_started
+                # Assumption: text in TTSSpeakFrame does not include inter-frame spaces
+                await self._push_tts_frames(
+                    AggregatedTextFrame(frame.text, AggregationType.SENTENCE),
+                    append_tts_text_to_context=frame.append_to_context,
+                    push_assistant_aggregation=push_assistant_aggregation,
+                )
+                await self.on_turn_context_completed()
+                # We pause processing incoming frames because we are sending data to
+                # the TTS. We pause to avoid audio overlapping.
+                await self._maybe_pause_frame_processing()
+            finally:
+                self._turn_context_id = saved_turn_context_id
+                self._pending_retry_group_id = saved_pending_retry_group_id
+                self._sent_non_whitespace_in_context = saved_sent_non_whitespace
+                self._processing_text = processing_text
         elif isinstance(frame, TTSUpdateSettingsFrame):
             if frame.service is not None and frame.service is not self:
                 await self.push_frame(frame, direction)
@@ -770,6 +777,7 @@ class TTSService(AIService):
                     await self.push_frame(LLMAssistantPushAggregationFrame())
                 logger.debug(f"{self} cleaning up TTS context {frame.context_id}")
                 del self._tts_contexts[frame.context_id]
+            self._cleanup_retry_group(frame.context_id)
 
         if self._push_silence_after_stop and isinstance(frame, TTSStoppedFrame):
             silence_num_bytes = int(self._silence_time_s * self.sample_rate * 2)  # 16-bit
@@ -783,6 +791,13 @@ class TTSService(AIService):
 
         if isinstance(frame, (TTSStartedFrame, TTSStoppedFrame, TTSAudioRawFrame, TTSTextFrame)):
             frame.transport_destination = self._transport_destination
+
+        if isinstance(frame, (TTSStartedFrame, TTSStoppedFrame, TTSErrorFrame)):
+            logger.info(
+                f"{self} push {type(frame).__name__} direction={direction.name} "
+                f"context={getattr(frame, 'context_id', None) or getattr(frame, 'tts_context_id', None)} "
+                f"retry_group={getattr(frame, 'retry_group_id', None) or self._retry_group_for_context(getattr(frame, 'context_id', None))}"
+            )
 
         await super().push_frame(frame, direction)
 
@@ -958,6 +973,13 @@ class TTSService(AIService):
 
         # Create context ID and store metadata
         context_id = self.create_context_id()
+        retry_group_id = self._register_retry_group(
+            context_id, self._pending_retry_group_id or self._retry_group_for_context(context_id)
+        )
+        logger.info(
+            f"{self} schedule TTS context={context_id} retry_group={retry_group_id} "
+            f"aggregation={type} append_to_context={append_tts_text_to_context} text={text[:160]!r}"
+        )
 
         # To support use cases that may want to know the text before it's spoken, we
         # push the AggregatedTextFrame version before transforming and sending to TTS.
@@ -1065,6 +1087,7 @@ class TTSService(AIService):
                         exception=frame.exception,
                         text=original_text,
                         tts_context_id=context_id,
+                        retry_group_id=self._retry_group_for_context(context_id),
                     )
                 await self.append_to_audio_context(context_id, frame)
                 if isinstance(frame, TTSAudioRawFrame):
@@ -1187,7 +1210,24 @@ class TTSService(AIService):
         """
         await self._serialization_queue.put(context_id)
         self._audio_contexts[context_id] = asyncio.Queue()
-        logger.trace(f"{self} created audio context {context_id}")
+        logger.info(
+            f"{self} create audio context={context_id} "
+            f"retry_group={self._retry_group_for_context(context_id) or context_id}"
+        )
+
+    def _register_retry_group(self, context_id: str, retry_group_id: str | None = None) -> str:
+        retry_group = retry_group_id or context_id
+        self._retry_group_by_context[context_id] = retry_group
+        return retry_group
+
+    def _retry_group_for_context(self, context_id: str | None) -> str | None:
+        if not context_id:
+            return None
+        return self._retry_group_by_context.get(context_id)
+
+    def _cleanup_retry_group(self, context_id: str | None):
+        if context_id:
+            self._retry_group_by_context.pop(context_id, None)
 
     async def append_to_audio_context(
         self, context_id: str, frame: Frame | _WordTimestampEntry | None
@@ -1207,6 +1247,11 @@ class TTSService(AIService):
             logger.debug(f"{self} unable to append audio to context: no context ID provided")
             return
         if self.audio_context_available(context_id):
+            if isinstance(frame, (TTSStartedFrame, TTSStoppedFrame, TTSErrorFrame, ErrorFrame)):
+                logger.info(
+                    f"{self} enqueue {type(frame).__name__} context={context_id} "
+                    f"retry_group={self._retry_group_for_context(context_id) or context_id}"
+                )
             logger.trace(f"{self} appending audio {frame} to audio context {context_id}")
             await self._audio_contexts[context_id].put(frame)
         # In case the frame is None, we should not recreate the context.
@@ -1317,10 +1362,18 @@ class TTSService(AIService):
         while running:
             context_value = await self._serialization_queue.get()
             if isinstance(context_value, Frame):
+                logger.info(
+                    f"{self} serialization push frame={type(context_value).__name__} "
+                    f"context={getattr(context_value, 'context_id', None)}"
+                )
                 await self.push_frame(context_value)
             elif isinstance(context_value, str):
                 context_id = context_value
                 self._playing_context_id = context_id
+                logger.info(
+                    f"{self} serialization start context={context_id} "
+                    f"retry_group={self._retry_group_for_context(context_id) or context_id}"
+                )
 
                 # Process the audio context until the context doesn't have more
                 # audio available (i.e. we find None).
@@ -1328,6 +1381,7 @@ class TTSService(AIService):
 
                 # We just finished processing the context, so we can safely remove it.
                 del self._audio_contexts[context_id]
+                self._cleanup_retry_group(context_id)
                 await self.on_audio_context_completed(context_id=context_id)
                 self.reset_active_audio_context()
             else:
@@ -1358,6 +1412,10 @@ class TTSService(AIService):
         running = True
         timestamps_started = False
         should_push_stop_frame = False
+        logger.info(
+            f"{self} playback begin context={context_id} "
+            f"retry_group={self._retry_group_for_context(context_id) or context_id}"
+        )
         while running:
             try:
                 frame = await asyncio.wait_for(queue.get(), timeout=self._stop_frame_timeout_s)
@@ -1402,6 +1460,10 @@ class TTSService(AIService):
                     await self.push_frame(TTSStoppedFrame(context_id=context_id))
                     should_push_stop_frame = False
                 break
+        logger.info(
+            f"{self} playback end context={context_id} "
+            f"retry_group={self._retry_group_for_context(context_id) or context_id}"
+        )
 
         if should_push_stop_frame and self._push_stop_frames:
             await self.push_frame(TTSStoppedFrame(context_id=context_id))
