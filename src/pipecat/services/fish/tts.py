@@ -25,6 +25,7 @@ from pipecat.frames.frames import (
     StartFrame,
     TTSAudioRawFrame,
     TTSErrorFrame,
+    TTSSentenceBoundaryFrame,
     TTSStoppedFrame,
 )
 from pipecat.services.settings import NOT_GIVEN, TTSSettings, _NotGiven, assert_given
@@ -412,9 +413,18 @@ class FishAudioTTSService(InterruptibleTTSService):
                                     gap_ms = (time.monotonic() - _last_audio_time) * 1000
                                     if _GAP_MIN_MS < gap_ms < _GAP_MAX_MS:
                                         logger.info(
-                                            f"{self}: inserting {self._inter_utterance_silence_s}s "
-                                            f"silence context={context_id} "
+                                            f"{self}: sentence boundary detected "
+                                            f"context={context_id} "
                                             f"retry_group={retry_group_id or context_id} gap_ms={gap_ms:.0f}"
+                                        )
+                                        # Push sentence boundary frame before silence.
+                                        # At this point all audio for the previous sentence
+                                        # has been appended to the audio context.
+                                        boundary = TTSSentenceBoundaryFrame(
+                                            context_id=context_id,
+                                        )
+                                        await self.append_to_audio_context(
+                                            context_id, boundary
                                         )
                                         num_bytes = int(
                                             self._inter_utterance_silence_s * self.sample_rate * 2
