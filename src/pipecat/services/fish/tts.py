@@ -372,9 +372,13 @@ class FishAudioTTSService(InterruptibleTTSService):
             await self._disconnect_websocket()
             await self._connect_websocket()
             if self._websocket and not self._receive_task:
-                self._receive_task = self.create_task(self._receive_task_handler(self._report_error))
+                self._receive_task = self.create_task(
+                    self._receive_task_handler(self._report_error)
+                )
         except Exception as e:
-            await self.push_error(error_msg=f"Failed to reconnect Fish Audio websocket: {e}", exception=e)
+            await self.push_error(
+                error_msg=f"Failed to reconnect Fish Audio websocket: {e}", exception=e
+            )
         finally:
             self._reconnect_task = None
 
@@ -424,9 +428,7 @@ class FishAudioTTSService(InterruptibleTTSService):
                                         boundary = TTSSentenceBoundaryFrame(
                                             context_id=context_id,
                                         )
-                                        await self.append_to_audio_context(
-                                            context_id, boundary
-                                        )
+                                        await self.append_to_audio_context(context_id, boundary)
                                         num_bytes = int(
                                             self._inter_utterance_silence_s * self.sample_rate * 2
                                         )
