@@ -1092,10 +1092,13 @@ class TTSService(AIService):
             # Appending to the context, so it preserves the ordering.
             await self.append_to_audio_context(context_id, frame)
 
-        # Push sentence boundary frame after all audio and text for this sentence
-        # have been pushed. This allows downstream processors (e.g. caching mixins)
-        # to finalize per-sentence audio buffers.
-        if type == AggregationType.SENTENCE:
+        # For HTTP-based TTS services (where run_tts yields audio frames synchronously),
+        # all audio for this sentence is already in the audio context at this point,
+        # so we can safely push a sentence boundary frame now.
+        # For WebSocket-based TTS services (where run_tts yields None and audio arrives
+        # asynchronously via a receive loop), the boundary frame must be inserted by the
+        # service itself (e.g. in _receive_messages upon detecting a sentence gap).
+        if type == AggregationType.SENTENCE and self._is_yielding_frames_synchronously:
             boundary_frame = TTSSentenceBoundaryFrame(context_id=context_id, text=text)
             await self.append_to_audio_context(context_id, boundary_frame)
 
