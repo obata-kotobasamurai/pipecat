@@ -40,6 +40,7 @@ from pipecat.frames.frames import (
     TranscriptionFrame,
     TTSAudioRawFrame,
     TTSErrorFrame,
+    TTSSentenceBoundaryFrame,
     TTSSpeakFrame,
     TTSStartedFrame,
     TTSStoppedFrame,
@@ -816,6 +817,7 @@ class TTSService(AIService):
                 sample_rate=self.sample_rate,
                 num_channels=1,
             )
+            silence_frame.metadata["_tts_silence"] = True
             silence_frame.transport_destination = self._transport_destination
             await self.push_frame(silence_frame)
 
@@ -1089,6 +1091,13 @@ class TTSService(AIService):
                 frame.append_to_context = append_tts_text_to_context
             # Appending to the context, so it preserves the ordering.
             await self.append_to_audio_context(context_id, frame)
+
+        # Push sentence boundary frame after all audio and text for this sentence
+        # have been pushed. This allows downstream processors (e.g. caching mixins)
+        # to finalize per-sentence audio buffers.
+        if type == AggregationType.SENTENCE:
+            boundary_frame = TTSSentenceBoundaryFrame(context_id=context_id, text=text)
+            await self.append_to_audio_context(context_id, boundary_frame)
 
     async def tts_process_generator(
         self,

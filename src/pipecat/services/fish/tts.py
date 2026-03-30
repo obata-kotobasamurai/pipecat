@@ -425,6 +425,7 @@ class FishAudioTTSService(InterruptibleTTSService):
                                             sample_rate=self.sample_rate,
                                             num_channels=1,
                                         )
+                                        silence.metadata["_tts_silence"] = True
                                         await self.append_to_audio_context(context_id, silence)
 
                                 frame = TTSAudioRawFrame(
