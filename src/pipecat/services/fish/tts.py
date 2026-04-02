@@ -397,6 +397,11 @@ class FishAudioTTSService(InterruptibleTTSService):
         _GAP_MAX_MS = 5000  # above this, likely a turn boundary (skip silence)
         _last_audio_time = 0.0
 
+        # Diagnostics: track received audio for error reporting
+        _audio_chunks_received = 0
+        _audio_bytes_received = 0
+        _audio_duration_s = 0.0
+
         async for message in self._get_websocket():
             try:
                 if isinstance(message, bytes):
@@ -455,6 +460,9 @@ class FishAudioTTSService(InterruptibleTTSService):
                                 await self.append_to_audio_context(context_id, frame)
                                 await self.stop_ttfb_metrics()
                                 _last_audio_time = time.monotonic()
+                                _audio_chunks_received += 1
+                                _audio_bytes_received += len(audio_data)
+                                _audio_duration_s += len(audio_data) / 2 / self.sample_rate
                         elif event == "finish":
                             reason = msg.get("reason", "unknown")
                             context_id = self.get_active_audio_context_id()
@@ -467,6 +475,20 @@ class FishAudioTTSService(InterruptibleTTSService):
                                     self._tts_text_by_context.get(context_id, "")
                                     if context_id
                                     else ""
+                                )
+                                # Diagnostic: how much audio was successfully received before the error
+                                pending_texts = list(self._tts_text_by_context.keys())
+                                ctx_queue_size = 0
+                                if context_id and self.audio_context_available(context_id):
+                                    ctx_queue_size = self._audio_contexts[context_id].qsize()
+                                logger.warning(
+                                    f"{self}: [DIAG] Fish finish reason=error — "
+                                    f"audio_received: {_audio_chunks_received} chunks, "
+                                    f"{_audio_bytes_received} bytes, {_audio_duration_s:.1f}s | "
+                                    f"audio_context_queue_size={ctx_queue_size} | "
+                                    f"pending_tts_texts={len(pending_texts)} | "
+                                    f"failed_text={text[:160]!r} | "
+                                    f"context={context_id}"
                                 )
                                 error_frame = TTSErrorFrame(
                                     error="Fish Audio server error during synthesis",
