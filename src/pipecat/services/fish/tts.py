@@ -363,6 +363,12 @@ class FishAudioTTSService(InterruptibleTTSService):
             return
         logger.info(f"{self}: scheduling Fish Audio websocket reconnect after synthesis error")
         self._receive_task = None
+        # Signal to the parent _receive_task_handler that we are handling
+        # reconnection ourselves.  When _receive_messages() returns after this,
+        # the parent loop will see _reconnect_in_progress=True and skip its own
+        # redundant reconnect (which would emit a spurious ErrorFrame and
+        # trigger an unwanted ServiceSwitcher failover).
+        self._reconnect_in_progress = True
         self._reconnect_task = self.create_task(self._reconnect_after_error())
 
     async def _reconnect_after_error(self):
@@ -380,6 +386,7 @@ class FishAudioTTSService(InterruptibleTTSService):
             )
         finally:
             self._reconnect_task = None
+            self._reconnect_in_progress = False
 
     async def _receive_messages(self):
         import time
