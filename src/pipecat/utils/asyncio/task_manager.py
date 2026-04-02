@@ -187,6 +187,8 @@ class TaskManager(BaseTaskManager):
             task: The task to be cancelled.
             timeout: The optional timeout in seconds to wait for the task to cancel.
         """
+        if task is None:
+            return
         name = task.get_name()
         task.cancel()
         try:
