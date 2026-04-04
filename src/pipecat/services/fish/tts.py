@@ -342,7 +342,10 @@ class FishAudioTTSService(InterruptibleTTSService):
                 await self._websocket.send(ormsgpack.packb(stop_message))
                 await self._websocket.close()
         except Exception as e:
-            await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
+            # Don't push ErrorFrame for WS disconnect errors — they are
+            # expected during internal retry and would trigger unwanted
+            # ServiceSwitcher failover.
+            logger.warning(f"{self}: WS disconnect error (suppressed): {e}")
         finally:
             self._websocket = None
             await self._call_event_handler("on_disconnected")
