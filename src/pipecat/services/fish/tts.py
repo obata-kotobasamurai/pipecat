@@ -208,7 +208,7 @@ class FishAudioTTSService(InterruptibleTTSService):
         # Internal retry: on Fish synthesis errors, reconnect WS and resend
         # pending texts without closing the audio context, preserving
         # serialization queue ordering.
-        self._pending_texts: dict[str, list[str]] = {}
+        self._retry_pending_texts: dict[str, list[str]] = {}
         self._retry_counts: dict[str, int] = {}
         self._max_internal_retries: int = 3
         self._reconnect_event = asyncio.Event()
@@ -363,7 +363,7 @@ class FishAudioTTSService(InterruptibleTTSService):
 
     async def on_audio_context_interrupted(self, context_id: str):
         """Stop all metrics and clean up retry state when audio context is interrupted."""
-        self._pending_texts.pop(context_id, None)
+        self._retry_pending_texts.pop(context_id, None)
         self._retry_counts.pop(context_id, None)
         await self.stop_all_metrics()
         await super().on_audio_context_interrupted(context_id)
@@ -403,7 +403,7 @@ class FishAudioTTSService(InterruptibleTTSService):
                 self._refresh_audio_context(context_id)
 
             # Resend all pending texts for this context in order
-            pending = self._pending_texts.get(context_id, []) if context_id else []
+            pending = self._retry_pending_texts.get(context_id, []) if context_id else []
             for text in pending:
                 logger.info(
                     f"{self}: [INTERNAL_RETRY] resending text context={context_id} "
@@ -430,7 +430,7 @@ class FishAudioTTSService(InterruptibleTTSService):
         self, context_id: str, exception: Exception | None = None
     ):
         """Push ErrorFrame and close the audio context after internal retries exhausted."""
-        pending = self._pending_texts.pop(context_id, [])
+        pending = self._retry_pending_texts.pop(context_id, [])
         self._retry_counts.pop(context_id, None)
         texts_summary = "; ".join(t[:80] for t in pending) if pending else "(none)"
         logger.error(
@@ -560,12 +560,12 @@ class FishAudioTTSService(InterruptibleTTSService):
                                     return
                             else:
                                 # Success — pop the first pending text
-                                if context_id and context_id in self._pending_texts:
-                                    pending = self._pending_texts[context_id]
+                                if context_id and context_id in self._retry_pending_texts:
+                                    pending = self._retry_pending_texts[context_id]
                                     if pending:
                                         pending.pop(0)
                                     if not pending:
-                                        del self._pending_texts[context_id]
+                                        del self._retry_pending_texts[context_id]
                                 if context_id:
                                     self._retry_counts.pop(context_id, None)
                                 logger.debug(f"Fish Audio session finished: {reason}")
@@ -605,7 +605,7 @@ class FishAudioTTSService(InterruptibleTTSService):
         await self._reconnect_event.wait()
 
         # Track this text as pending for internal retry
-        self._pending_texts.setdefault(context_id, []).append(text)
+        self._retry_pending_texts.setdefault(context_id, []).append(text)
 
         try:
             if not self._websocket or self._websocket.state is State.CLOSED:
