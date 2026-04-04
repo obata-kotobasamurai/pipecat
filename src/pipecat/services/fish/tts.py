@@ -10,6 +10,7 @@ This module provides integration with Fish Audio's real-time TTS WebSocket API
 for streaming text-to-speech synthesis with customizable voice parameters.
 """
 
+import asyncio
 from collections.abc import AsyncGenerator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Self
@@ -24,7 +25,6 @@ from pipecat.frames.frames import (
     Frame,
     StartFrame,
     TTSAudioRawFrame,
-    TTSErrorFrame,
     TTSSentenceBoundaryFrame,
     TTSStoppedFrame,
 )
@@ -202,9 +202,17 @@ class FishAudioTTSService(InterruptibleTTSService):
         self._websocket = None
         self._receive_task = None
         self._reconnect_task = None
-        self._tts_text_by_context: dict[str, str] = {}
         self._inter_utterance_silence_s = inter_utterance_silence_s
         logger.debug(f"{self}: inter_utterance_silence_s={self._inter_utterance_silence_s}")
+
+        # Internal retry: on Fish synthesis errors, reconnect WS and resend
+        # pending texts without closing the audio context, preserving
+        # serialization queue ordering.
+        self._pending_texts: dict[str, list[str]] = {}
+        self._retry_counts: dict[str, int] = {}
+        self._max_internal_retries: int = 3
+        self._reconnect_event = asyncio.Event()
+        self._reconnect_event.set()
 
         # Init-only audio format config (not runtime-updatable).
         self._fish_sample_rate = 0  # Set in start()
@@ -354,40 +362,91 @@ class FishAudioTTSService(InterruptibleTTSService):
         raise Exception("Websocket not connected")
 
     async def on_audio_context_interrupted(self, context_id: str):
-        """Stop all metrics when audio context is interrupted."""
+        """Stop all metrics and clean up retry state when audio context is interrupted."""
+        self._pending_texts.pop(context_id, None)
+        self._retry_counts.pop(context_id, None)
         await self.stop_all_metrics()
         await super().on_audio_context_interrupted(context_id)
 
-    def _schedule_reconnect_after_error(self):
+    def _schedule_reconnect_after_error(self, context_id: str | None = None):
         if self._reconnect_task and not self._reconnect_task.done():
-            logger.info(f"{self}: reconnect already scheduled after synthesis error")
+            logger.debug(f"{self}: [INTERNAL_RETRY] reconnect already scheduled")
             return
-        logger.info(f"{self}: scheduling Fish Audio websocket reconnect after synthesis error")
+        logger.info(f"{self}: [INTERNAL_RETRY] scheduling WS reconnect context={context_id}")
         self._receive_task = None
         # Signal to the parent _receive_task_handler that we are handling
-        # reconnection ourselves.  When _receive_messages() returns after this,
-        # the parent loop will see _reconnect_in_progress=True and skip its own
-        # redundant reconnect (which would emit a spurious ErrorFrame and
-        # trigger an unwanted ServiceSwitcher failover).
+        # reconnection ourselves so it skips its own redundant reconnect.
         self._reconnect_in_progress = True
-        self._reconnect_task = self.create_task(self._reconnect_after_error())
+        self._reconnect_event.clear()
+        self._reconnect_task = self.create_task(
+            self._reconnect_and_resend(context_id), name="fish_reconnect"
+        )
 
-    async def _reconnect_after_error(self):
+    async def _reconnect_and_resend(self, context_id: str | None = None):
         try:
-            logger.info(f"{self}: reconnecting Fish Audio websocket after synthesis error")
+            # Keep audio context alive during reconnect so the serialization
+            # queue doesn't move on to the next context.
+            if context_id and self.audio_context_available(context_id):
+                self._refresh_audio_context(context_id)
+
             await self._disconnect_websocket()
             await self._connect_websocket()
-            if self._websocket and not self._receive_task:
+
+            if not self._websocket:
+                logger.error(f"{self}: [INTERNAL_RETRY] reconnect failed, WS not available")
+                if context_id:
+                    await self._exhaust_and_propagate_error(context_id)
+                return
+
+            # Keep context alive after reconnect
+            if context_id and self.audio_context_available(context_id):
+                self._refresh_audio_context(context_id)
+
+            # Resend all pending texts for this context in order
+            pending = self._pending_texts.get(context_id, []) if context_id else []
+            for text in pending:
+                logger.info(
+                    f"{self}: [INTERNAL_RETRY] resending text context={context_id} "
+                    f"text={text[:80]!r}"
+                )
+                await self._websocket.send(ormsgpack.packb({"event": "text", "text": text}))
+                await self._websocket.send(ormsgpack.packb({"event": "flush"}))
+
+            # Start new receive loop
+            if not self._receive_task:
                 self._receive_task = self.create_task(
                     self._receive_task_handler(self._report_error)
                 )
         except Exception as e:
-            await self.push_error(
-                error_msg=f"Failed to reconnect Fish Audio websocket: {e}", exception=e
-            )
+            logger.error(f"{self}: [INTERNAL_RETRY] reconnect failed: {e}")
+            if context_id:
+                await self._exhaust_and_propagate_error(context_id, exception=e)
         finally:
             self._reconnect_task = None
             self._reconnect_in_progress = False
+            self._reconnect_event.set()
+
+    async def _exhaust_and_propagate_error(
+        self, context_id: str, exception: Exception | None = None
+    ):
+        """Push ErrorFrame and close the audio context after internal retries exhausted."""
+        pending = self._pending_texts.pop(context_id, [])
+        self._retry_counts.pop(context_id, None)
+        texts_summary = "; ".join(t[:80] for t in pending) if pending else "(none)"
+        logger.error(
+            f"{self}: [INTERNAL_RETRY] exhausted {self._max_internal_retries} retries "
+            f"for context={context_id}, failing over. pending_texts=[{texts_summary}]"
+        )
+        await self.push_error(
+            error_msg=(
+                f"Fish Audio synthesis failed after {self._max_internal_retries} "
+                f"internal retries (context={context_id})"
+            ),
+            exception=exception,
+        )
+        if self.audio_context_available(context_id):
+            await self.append_to_audio_context(context_id, TTSStoppedFrame(context_id=context_id))
+            await self.remove_audio_context(context_id)
 
     async def _receive_messages(self):
         import time
@@ -417,7 +476,8 @@ class FishAudioTTSService(InterruptibleTTSService):
                                 retry_group_id = self._retry_group_for_context(context_id)
                                 logger.debug(
                                     f"{self}: recv Fish audio event context={context_id} "
-                                    f"retry_group={retry_group_id or context_id} bytes={len(audio_data)}"
+                                    f"retry_group={retry_group_id or context_id} "
+                                    f"bytes={len(audio_data)}"
                                 )
 
                                 # Detect sentence boundary and insert silence
@@ -432,11 +492,9 @@ class FishAudioTTSService(InterruptibleTTSService):
                                         logger.info(
                                             f"{self}: sentence boundary detected "
                                             f"context={context_id} "
-                                            f"retry_group={retry_group_id or context_id} gap_ms={gap_ms:.0f}"
+                                            f"retry_group={retry_group_id or context_id} "
+                                            f"gap_ms={gap_ms:.0f}"
                                         )
-                                        # Push sentence boundary frame before silence.
-                                        # At this point all audio for the previous sentence
-                                        # has been appended to the audio context.
                                         boundary = TTSSentenceBoundaryFrame(
                                             context_id=context_id,
                                         )
@@ -468,87 +526,60 @@ class FishAudioTTSService(InterruptibleTTSService):
                             reason = msg.get("reason", "unknown")
                             context_id = self.get_active_audio_context_id()
                             logger.info(
-                                f"{self}: recv Fish finish event reason={reason} context={context_id} "
-                                f"retry_group={self._retry_group_for_context(context_id) or context_id}"
+                                f"{self}: recv Fish finish event reason={reason} "
+                                f"context={context_id} "
+                                f"retry_group="
+                                f"{self._retry_group_for_context(context_id) or context_id}"
                             )
                             if reason == "error":
-                                text = (
-                                    self._tts_text_by_context.get(context_id, "")
-                                    if context_id
-                                    else ""
+                                count = (
+                                    self._retry_counts.get(context_id, 0) + 1 if context_id else 1
                                 )
-                                # Diagnostic: how much audio was successfully received before the error
-                                pending_texts = list(self._tts_text_by_context.keys())
+                                if context_id:
+                                    self._retry_counts[context_id] = count
+                                # Diagnostic info
                                 ctx_queue_size = 0
                                 if context_id and self.audio_context_available(context_id):
                                     ctx_queue_size = self._audio_contexts[context_id].qsize()
                                 logger.warning(
-                                    f"{self}: [DIAG] Fish finish reason=error — "
+                                    f"{self}: [INTERNAL_RETRY] Fish finish reason=error "
+                                    f"attempt={count}/{self._max_internal_retries} "
+                                    f"context={context_id} | "
                                     f"audio_received: {_audio_chunks_received} chunks, "
-                                    f"{_audio_bytes_received} bytes, {_audio_duration_s:.1f}s | "
-                                    f"audio_context_queue_size={ctx_queue_size} | "
-                                    f"pending_tts_texts={len(pending_texts)} | "
-                                    f"failed_text={text[:160]!r} | "
-                                    f"context={context_id}"
+                                    f"{_audio_bytes_received} bytes, "
+                                    f"{_audio_duration_s:.1f}s | "
+                                    f"audio_context_queue_size={ctx_queue_size}"
                                 )
-                                error_frame = TTSErrorFrame(
-                                    error="Fish Audio server error during synthesis",
-                                    text=text,
-                                    tts_context_id=context_id,
-                                    retry_group_id=self._retry_group_for_context(context_id),
-                                )
-                                logger.info(
-                                    f"{self}: emit TTSErrorFrame context={context_id} "
-                                    f"retry_group={error_frame.retry_group_id or context_id} text={text[:160]!r}"
-                                )
-                                await self.push_error_frame(error_frame)
-                                if context_id:
-                                    self._tts_text_by_context.pop(context_id, None)
-                                    # Close the failed audio context immediately so
-                                    # queued retries/failover contexts are not blocked
-                                    # behind the 3s audio-context timeout.
-                                    await self.append_to_audio_context(
-                                        context_id,
-                                        TTSStoppedFrame(context_id=context_id),
-                                    )
-                                    await self.remove_audio_context(context_id)
-                                    logger.info(
-                                        f"{self}: closed failed context={context_id} "
-                                        f"retry_group={error_frame.retry_group_id or context_id}"
-                                    )
-                                self._schedule_reconnect_after_error()
-                                return
+                                if count <= self._max_internal_retries:
+                                    self._schedule_reconnect_after_error(context_id)
+                                    return
+                                else:
+                                    if context_id:
+                                        await self._exhaust_and_propagate_error(context_id)
+                                    self._schedule_reconnect_after_error()
+                                    return
                             else:
+                                # Success — pop the first pending text
+                                if context_id and context_id in self._pending_texts:
+                                    pending = self._pending_texts[context_id]
+                                    if pending:
+                                        pending.pop(0)
+                                    if not pending:
+                                        del self._pending_texts[context_id]
                                 if context_id:
-                                    self._tts_text_by_context.pop(context_id, None)
+                                    self._retry_counts.pop(context_id, None)
                                 logger.debug(f"Fish Audio session finished: {reason}")
 
             except Exception as e:
                 context_id = self.get_active_audio_context_id()
-                text = self._tts_text_by_context.get(context_id, "") if context_id else ""
-                error_frame = TTSErrorFrame(
-                    error=f"Unknown error occurred: {e}",
-                    exception=e,
-                    text=text,
-                    tts_context_id=context_id,
-                    retry_group_id=self._retry_group_for_context(context_id),
+                logger.error(
+                    f"{self}: [INTERNAL_RETRY] receive-loop exception "
+                    f"context={context_id} error={e!r}"
                 )
-                logger.info(
-                    f"{self}: emit TTSErrorFrame from receive-loop exception context={context_id} "
-                    f"retry_group={error_frame.retry_group_id or context_id} error={e!r} text={text[:160]!r}"
-                )
-                await self.push_error_frame(error_frame)
                 if context_id:
-                    self._tts_text_by_context.pop(context_id, None)
-                    await self.append_to_audio_context(
-                        context_id,
-                        TTSStoppedFrame(context_id=context_id),
-                    )
-                    await self.remove_audio_context(context_id)
-                    logger.info(
-                        f"{self}: closed failed context after exception context={context_id} "
-                        f"retry_group={error_frame.retry_group_id or context_id}"
-                    )
+                    await self._exhaust_and_propagate_error(context_id, exception=e)
+                else:
+                    await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
                 self._schedule_reconnect_after_error()
                 return
 
@@ -564,11 +595,18 @@ class FishAudioTTSService(InterruptibleTTSService):
             Frame: Audio frames and control frames for the synthesized speech.
         """
         logger.debug(f"{self}: Generating Fish TTS: [{text}]")
-        self._tts_text_by_context[context_id] = text
         logger.info(
             f"{self}: run_tts context={context_id} "
-            f"retry_group={self._retry_group_for_context(context_id) or context_id} text={text[:160]!r}"
+            f"retry_group={self._retry_group_for_context(context_id) or context_id} "
+            f"text={text[:160]!r}"
         )
+
+        # Wait if a reconnect is in progress (from a previous sentence's error)
+        await self._reconnect_event.wait()
+
+        # Track this text as pending for internal retry
+        self._pending_texts.setdefault(context_id, []).append(text)
+
         try:
             if not self._websocket or self._websocket.state is State.CLOSED:
                 await self._connect()
