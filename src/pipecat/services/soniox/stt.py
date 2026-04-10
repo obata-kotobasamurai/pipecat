@@ -226,6 +226,7 @@ class SonioxSTTSettings(STTSettings):
         default_factory=lambda: NOT_GIVEN
     )
     client_reference_id: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    max_endpoint_delay_ms: int | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 class SonioxSTTService(WebsocketSTTService):
@@ -322,6 +323,8 @@ class SonioxSTTService(WebsocketSTTService):
                     params.enable_language_identification
                 )
                 default_settings.client_reference_id = params.client_reference_id
+                if params.max_endpoint_delay_ms is not None:
+                    default_settings.max_endpoint_delay_ms = params.max_endpoint_delay_ms
 
         # --- 4. Settings delta (canonical API, always wins) ---
         if settings is not None:
