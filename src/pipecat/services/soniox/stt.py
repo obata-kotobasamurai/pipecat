@@ -22,6 +22,7 @@ from pipecat.frames.frames import (
     InterimTranscriptionFrame,
     StartFrame,
     TranscriptionFrame,
+    UserStoppedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
@@ -251,6 +252,7 @@ class SonioxSTTService(WebsocketSTTService):
         num_channels: int = 1,
         params: SonioxInputParams | None = None,
         vad_force_turn_endpoint: bool = True,
+        native_turn_detection: bool = False,
         settings: Settings | None = None,
         ttfs_p99_latency: float | None = SONIOX_TTFS_P99,
         **kwargs,
@@ -276,6 +278,10 @@ class SonioxSTTService(WebsocketSTTService):
 
             vad_force_turn_endpoint: Listen to `VADUserStoppedSpeakingFrame` to send finalize message to Soniox.
                 If disabled, Soniox will detect the end of the speech. Defaults to True.
+            native_turn_detection: When True, Soniox broadcasts ``UserStoppedSpeakingFrame``
+                on each ``<end>`` token. Use with ``ExternalUserTurnStopStrategy`` (for stop)
+                and ``VADUserTurnStartStrategy`` (for start). Implies
+                ``vad_force_turn_endpoint=False``. Defaults to False.
             settings: Runtime-updatable settings. When provided alongside deprecated
                 parameters, ``settings`` values take precedence.
             ttfs_p99_latency: P99 latency from speech end to final transcript in seconds.
@@ -332,6 +338,9 @@ class SonioxSTTService(WebsocketSTTService):
 
         self._api_key = api_key
         self._url = url
+        self._native_turn_detection = native_turn_detection
+        if native_turn_detection:
+            vad_force_turn_endpoint = False
         self._vad_force_turn_endpoint = vad_force_turn_endpoint
 
         # Init-only audio config
@@ -574,6 +583,9 @@ class SonioxSTTService(WebsocketSTTService):
                 await self._handle_transcription(text, is_final=True)
                 await self.stop_processing_metrics()
                 self._final_transcription_buffer = []
+                # Native turn detection: signal turn end to ExternalUserTurnStopStrategy
+                if self._native_turn_detection:
+                    await self.push_frame(UserStoppedSpeakingFrame())
 
         async for message in self._get_websocket():
             try:
