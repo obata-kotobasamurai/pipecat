@@ -312,6 +312,7 @@ class SonioxSTTService(WebsocketSTTService):
             enable_speaker_diarization=False,
             enable_language_identification=False,
             client_reference_id=None,
+            max_endpoint_delay_ms=None,
         )
 
         # --- 2. Deprecated direct-arg overrides ---
