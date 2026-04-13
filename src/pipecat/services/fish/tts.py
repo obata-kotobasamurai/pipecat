@@ -424,6 +424,7 @@ class FishAudioTTSService(InterruptibleTTSService):
             if context_id:
                 await self._exhaust_and_propagate_error(context_id, exception=e)
         finally:
+            reconnect_succeeded = self._websocket is not None
             self._reconnect_task = None
             self._reconnect_in_progress = False
             self._reconnect_event.set()
@@ -431,16 +432,20 @@ class FishAudioTTSService(InterruptibleTTSService):
             # reconnect was running, its own _schedule_reconnect_after_error
             # was short-circuited by the early-return. Re-schedule here so
             # the leftover pending gets resent instead of being lost.
-            leftover = next(
-                (
-                    ctx
-                    for ctx, texts in self._retry_pending_texts.items()
-                    if texts and ctx != context_id
-                ),
-                None,
-            )
-            if leftover:
-                self._schedule_reconnect_after_error(leftover)
+            # Skip when the reconnect itself failed — otherwise two
+            # contexts can ping-pong re-scheduling each other forever
+            # while the WS keeps failing to connect.
+            if reconnect_succeeded:
+                leftover = next(
+                    (
+                        ctx
+                        for ctx, texts in self._retry_pending_texts.items()
+                        if texts and ctx != context_id
+                    ),
+                    None,
+                )
+                if leftover:
+                    self._schedule_reconnect_after_error(leftover)
 
     async def _exhaust_and_propagate_error(
         self, context_id: str, exception: Exception | None = None
