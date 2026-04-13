@@ -427,6 +427,20 @@ class FishAudioTTSService(InterruptibleTTSService):
             self._reconnect_task = None
             self._reconnect_in_progress = False
             self._reconnect_event.set()
+            # If another context accumulated pending texts while this
+            # reconnect was running, its own _schedule_reconnect_after_error
+            # was short-circuited by the early-return. Re-schedule here so
+            # the leftover pending gets resent instead of being lost.
+            leftover = next(
+                (
+                    ctx
+                    for ctx, texts in self._retry_pending_texts.items()
+                    if texts and ctx != context_id
+                ),
+                None,
+            )
+            if leftover:
+                self._schedule_reconnect_after_error(leftover)
 
     async def _exhaust_and_propagate_error(
         self, context_id: str, exception: Exception | None = None
