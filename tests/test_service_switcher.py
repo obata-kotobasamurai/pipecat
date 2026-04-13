@@ -9,6 +9,7 @@
 import asyncio
 import unittest
 from dataclasses import dataclass
+from typing import Optional
 
 from pipecat.frames.frames import (
     ErrorFrame,
@@ -128,13 +129,23 @@ class ErrorOnTextService(FrameProcessor):
     def __init__(self, test_name: str, **kwargs):
         super().__init__(name=test_name, **kwargs)
         self._errored = False
+        self.processed_frames = []
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
+        self.processed_frames.append(frame)
         if isinstance(frame, TextFrame) and not self._errored:
             self._errored = True
             await self.push_error("service connection lost")
         await self.push_frame(frame, direction)
+
+
+class ReinjectOnErrorStrategy(ServiceSwitcherStrategy):
+    """A strategy that reinjects a replacement frame after an error."""
+
+    async def handle_error(self, error: ErrorFrame) -> Optional[FrameProcessor]:
+        await self.reinject_downstream(TextFrame(text="retry"))
+        return None
 
 
 @dataclass
@@ -472,6 +483,32 @@ class TestServiceSwitcher(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(switcher2_service2_texts), 1)
         self.assertEqual(switcher2_service2_texts[0].text, "After switching second switcher")
+
+    async def test_strategy_can_reinject_downstream_frame(self):
+        """Test that a strategy can re-enter the normal downstream path after an error."""
+        error_service = ErrorOnTextService("error_service")
+        backup_service = MockFrameProcessor("backup_service")
+        switcher = ServiceSwitcher(
+            [error_service, backup_service],
+            strategy_type=ReinjectOnErrorStrategy,
+        )
+
+        await run_test(
+            switcher,
+            frames_to_send=[TextFrame(text="original")],
+            expected_down_frames=[TextFrame, TextFrame],
+            expected_up_frames=[ErrorFrame],
+        )
+
+        error_service_texts = [
+            frame.text for frame in error_service.processed_frames if isinstance(frame, TextFrame)
+        ]
+        backup_service_texts = [
+            frame.text for frame in backup_service.processed_frames if isinstance(frame, TextFrame)
+        ]
+
+        self.assertEqual(error_service_texts, ["original", "retry"])
+        self.assertEqual(backup_service_texts, [])
 
 
 class TestServiceSwitcherMetadata(unittest.IsolatedAsyncioTestCase):

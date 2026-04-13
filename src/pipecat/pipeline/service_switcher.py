@@ -6,6 +6,8 @@
 
 """Service switcher for switching between different services at runtime, with different switching strategies."""
 
+from __future__ import annotations
+
 from typing import Any, Generic, TypeVar
 
 from loguru import logger
@@ -58,6 +60,7 @@ class ServiceSwitcherStrategy(BaseObject):
 
         self._services = services
         self._active_service = services[0]
+        self._switcher: ServiceSwitcher[Any] | None = None
 
         self._register_event_handler("on_service_switched")
 
@@ -102,6 +105,16 @@ class ServiceSwitcherStrategy(BaseObject):
             The newly active service if a switch occurred, or None otherwise.
         """
         return None
+
+    def attach_switcher(self, switcher: ServiceSwitcher[Any]) -> None:
+        """Attach the owning switcher so strategies can reinject frames."""
+        self._switcher = switcher
+
+    async def reinject_downstream(self, frame: Frame) -> None:
+        """Reinject a frame into the switcher's normal downstream path."""
+        if not self._switcher:
+            raise RuntimeError("ServiceSwitcherStrategy is not attached to a ServiceSwitcher")
+        await self._switcher.reinject_downstream(frame)
 
     async def _set_active_if_available(self, service: FrameProcessor) -> FrameProcessor | None:
         """Set the active service to the given one, if it is in the list of available services.
@@ -237,6 +250,7 @@ class ServiceSwitcher(ParallelPipeline, Generic[StrategyType]):
         super().__init__(*self._make_pipeline_definitions(services, _strategy))
         self._services = services
         self._strategy = _strategy
+        self._strategy.attach_switcher(self)
 
     @property
     def strategy(self) -> StrategyType:
@@ -320,6 +334,10 @@ class ServiceSwitcher(ParallelPipeline, Generic[StrategyType]):
                 await self.strategy.handle_error(frame)
 
         await super().push_frame(frame, direction)
+
+    async def reinject_downstream(self, frame: Frame):
+        """Inject a frame back into the switcher's standard downstream routing."""
+        await super().process_frame(frame, FrameDirection.DOWNSTREAM)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Process a frame, handling frames which affect service switching.
