@@ -113,9 +113,20 @@ class TaskObserver(BaseObserver):
         self._proxies = self._create_proxies(self._observers)
 
     async def stop(self):
-        """Stop all proxy observer tasks."""
+        """Stop all proxy observer tasks.
+
+        Drains each proxy queue before cancelling, so that observers can
+        finish processing any frames that were already enqueued.
+        """
         if not self._proxies:
             return
+
+        # Wait for queued items to be processed before cancelling.
+        for proxy in self._proxies.values():
+            try:
+                await asyncio.wait_for(proxy.queue.join(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
 
         for proxy in self._proxies.values():
             await self.cancel_task(proxy.task)
@@ -178,11 +189,16 @@ class TaskObserver(BaseObserver):
         while True:
             data = await queue.get()
 
-            if isinstance(data, _PipelineStartedSignal):
-                await observer.on_pipeline_started()
-            elif isinstance(data, FramePushed):
-                await observer.on_push_frame(data)
-            elif isinstance(data, FrameProcessed):
-                await observer.on_process_frame(data)
+            try:
+                if isinstance(data, _PipelineStartedSignal):
+                    await observer.on_pipeline_started()
+                elif isinstance(data, FramePushed):
+                    await observer.on_push_frame(data)
+                elif isinstance(data, FrameProcessed):
+                    await observer.on_process_frame(data)
+            except ValueError:
+                # Observer resource (e.g. file) may have been closed during
+                # pipeline shutdown.  Silently discard the frame.
+                pass
 
             queue.task_done()
