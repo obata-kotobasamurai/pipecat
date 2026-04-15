@@ -25,6 +25,7 @@ from pipecat.frames.frames import (
     Frame,
     StartFrame,
     TTSAudioRawFrame,
+    TTSErrorFrame,
     TTSSentenceBoundaryFrame,
     TTSStoppedFrame,
 )
@@ -451,7 +452,12 @@ class FishAudioTTSService(InterruptibleTTSService):
     async def _exhaust_and_propagate_error(
         self, context_id: str, exception: Exception | None = None
     ):
-        """Push ErrorFrame and close the audio context after internal retries exhausted."""
+        """Push TTSErrorFrame and close the audio context after internal retries exhausted.
+
+        Emits a TTSErrorFrame (instead of a plain ErrorFrame) so that the
+        ServiceSwitcher failover strategy can reinject the failed text into a
+        backup TTS service.
+        """
         pending = self._retry_pending_texts.pop(context_id, [])
         self._retry_counts.pop(context_id, None)
         texts_summary = "; ".join(t[:80] for t in pending) if pending else "(none)"
@@ -459,13 +465,20 @@ class FishAudioTTSService(InterruptibleTTSService):
             f"{self}: [INTERNAL_RETRY] exhausted {self._max_internal_retries} retries "
             f"for context={context_id}, failing over. pending_texts=[{texts_summary}]"
         )
-        await self.push_error(
-            error_msg=(
+        error_text = " ".join(pending) if pending else ""
+        error_frame = TTSErrorFrame(
+            error=(
                 f"Fish Audio synthesis failed after {self._max_internal_retries} "
                 f"internal retries (context={context_id})"
             ),
+            fatal=False,
+            processor=self,
             exception=exception,
+            text=error_text,
+            tts_context_id=context_id,
+            retry_group_id=self._retry_group_for_context(context_id),
         )
+        await self.push_error_frame(error=error_frame)
         if self.audio_context_available(context_id):
             await self.append_to_audio_context(context_id, TTSStoppedFrame(context_id=context_id))
             await self.remove_audio_context(context_id)
