@@ -22,12 +22,14 @@ import numpy as np
 from loguru import logger
 from pydantic import BaseModel
 
+from pipecat.audio.dtmf.types import KeypadEntry
 from pipecat.frames.frames import (
     CancelFrame,
     ClientConnectedFrame,
     EndFrame,
     Frame,
     InputAudioRawFrame,
+    InputDTMFFrame,
     InputTransportMessageFrame,
     OutputAudioRawFrame,
     OutputImageRawFrame,
@@ -972,7 +974,22 @@ class SmallWebRTCTransport(BaseTransport):
             await self._output.queue_frame(frame, FrameDirection.DOWNSTREAM)
 
     async def _on_app_message(self, message: Any, sender: str):
-        """Handle incoming application messages."""
+        """Handle incoming application messages.
+
+        Intercepts DTMF messages ({"type": "dtmf", "digit": "1"}) and converts
+        them to InputDTMFFrame for pipeline processing. All other messages are
+        forwarded as InputTransportMessageFrame via push_app_message().
+        """
+        if isinstance(message, dict) and message.get("type") == "dtmf":
+            digit = message.get("digit")
+            if digit and self._input:
+                try:
+                    frame = InputDTMFFrame(KeypadEntry(digit))
+                    await self._input.push_frame(frame)
+                    logger.debug(f"SmallWebRTC DTMF received: {digit}")
+                except ValueError:
+                    logger.warning(f"SmallWebRTC DTMF invalid digit: {digit}")
+            return
         if self._input:
             await self._input.push_app_message(message)
         await self._call_event_handler("on_app_message", message, sender)
