@@ -341,6 +341,7 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
 
         self._speech_config = None
         self._speech_synthesizer = None
+        self._synthesizer_stale = False
         self._audio_queue = asyncio.Queue()
         self._word_boundary_queue = asyncio.Queue()
         self._word_processor_task = None
@@ -401,6 +402,35 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
         # Start word processor task
         if not self._word_processor_task:
             self._word_processor_task = self.create_task(self._word_processor_task_handler())
+
+    def _recreate_synthesizer(self):
+        """Recreate the SpeechSynthesizer to recover from stale connections.
+
+        The SpeechConfig is reused (it holds no connection state).
+        Only the SpeechSynthesizer is torn down and rebuilt, which forces
+        the Azure SDK to open a fresh WebSocket connection.
+        """
+        logger.warning(f"{self}: Recreating SpeechSynthesizer (stale connection detected)")
+
+        if self._speech_synthesizer:
+            try:
+                self._speech_synthesizer.synthesizing.disconnect_all()
+                self._speech_synthesizer.synthesis_completed.disconnect_all()
+                self._speech_synthesizer.synthesis_canceled.disconnect_all()
+                self._speech_synthesizer.synthesis_word_boundary.disconnect_all()
+            except Exception as e:
+                logger.debug(f"{self}: Error disconnecting event handlers: {e}")
+
+        self._speech_synthesizer = SpeechSynthesizer(
+            speech_config=self._speech_config, audio_config=None
+        )
+
+        self._speech_synthesizer.synthesizing.connect(self._handle_synthesizing)
+        self._speech_synthesizer.synthesis_completed.connect(self._handle_completed)
+        self._speech_synthesizer.synthesis_canceled.connect(self._handle_canceled)
+        self._speech_synthesizer.synthesis_word_boundary.connect(self._handle_word_boundary)
+
+        self._synthesizer_stale = False
 
     async def stop(self, frame: EndFrame):
         """Stop the Azure TTS service.
@@ -597,6 +627,7 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
             error_msg = f"Azure TTS synthesis canceled: {reason}"
             if details.error_details:
                 error_msg += f" - {details.error_details}"
+            self._synthesizer_stale = True
             self._audio_queue.put_nowait(Exception(error_msg))
 
     async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
@@ -685,52 +716,90 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
             if self._speech_synthesizer is None:
                 return
 
-            try:
-                self._current_context_id = context_id
+            # Proactive recreation if stale flag was set (e.g., by _handle_canceled
+            # during idle period as a backup service)
+            if self._synthesizer_stale:
+                self._recreate_synthesizer()
+                # Drain any stale items from the old synthesizer's callbacks
+                while not self._audio_queue.empty():
+                    self._audio_queue.get_nowait()
+                    self._audio_queue.task_done()
 
-                # Capture base offset BEFORE starting synthesis to avoid race conditions
-                # Word boundary callbacks will use this value
-                self._current_sentence_base_offset = self._cumulative_audio_offset
-                self._current_sentence_duration = 0.0
-                self._current_sentence_max_word_offset = 0.0
+            max_attempts = 2  # Original attempt + 1 retry after recreate
+            for attempt in range(max_attempts):
+                try:
+                    self._current_context_id = context_id
 
-                ssml = self._construct_ssml(text)
-                self._speech_synthesizer.speak_ssml_async(ssml)
-                await self.start_tts_usage_metrics(text)
+                    # Capture base offset BEFORE starting synthesis to avoid race conditions
+                    # Word boundary callbacks will use this value
+                    self._current_sentence_base_offset = self._cumulative_audio_offset
+                    self._current_sentence_duration = 0.0
+                    self._current_sentence_max_word_offset = 0.0
 
-                # Stream audio chunks as they arrive
+                    ssml = self._construct_ssml(text)
+                    self._speech_synthesizer.speak_ssml_async(ssml)
+                    await self.start_tts_usage_metrics(text)
 
-                while True:
-                    chunk = await self._audio_queue.get()
-                    if chunk is None:  # End of stream
+                    # Stream audio chunks as they arrive
+                    synthesis_error = None
+                    while True:
+                        chunk = await self._audio_queue.get()
+                        if chunk is None:  # End of stream
+                            break
+                        if isinstance(chunk, Exception):  # Error from _handle_canceled
+                            synthesis_error = chunk
+                            break
+
+                        frame = TTSAudioRawFrame(
+                            audio=chunk,
+                            sample_rate=self.sample_rate,
+                            num_channels=1,
+                            context_id=context_id,
+                        )
+                        yield frame
+
+                    if synthesis_error:
+                        if attempt < max_attempts - 1:
+                            logger.warning(
+                                f"{self}: Synthesis failed (attempt {attempt + 1}/{max_attempts}), "
+                                f"recreating synthesizer and retrying: {synthesis_error}"
+                            )
+                            self._recreate_synthesizer()
+                            while not self._audio_queue.empty():
+                                self._audio_queue.get_nowait()
+                                self._audio_queue.task_done()
+                            continue
+                        else:
+                            yield ErrorFrame(error=str(synthesis_error))
+                            break
+                    else:
+                        # Success — update cumulative offset for next sentence
+                        # At 8kHz, Azure's audio_duration doesn't match word boundary offsets,
+                        # so we use max_word_offset as a workaround. At other sample rates,
+                        # audio_duration is accurate.
+                        # TODO: Remove after Azure fixes word boundary timing at 8kHz
+                        if self.sample_rate == 8000:
+                            self._cumulative_audio_offset += self._current_sentence_max_word_offset
+                        else:
+                            self._cumulative_audio_offset += self._current_sentence_duration
                         break
-                    if isinstance(chunk, Exception):  # Error from _handle_canceled
-                        yield ErrorFrame(error=str(chunk))
-                        break
 
-                    frame = TTSAudioRawFrame(
-                        audio=chunk,
-                        sample_rate=self.sample_rate,
-                        num_channels=1,
-                        context_id=context_id,
-                    )
-                    yield frame
-
-                # Update cumulative offset for next sentence
-                # At 8kHz, Azure's audio_duration doesn't match word boundary offsets,
-                # so we use max_word_offset as a workaround. At other sample rates,
-                # audio_duration is accurate.
-                # TODO: Remove after Azure fixes word boundary timing at 8kHz
-                if self.sample_rate == 8000:
-                    self._cumulative_audio_offset += self._current_sentence_max_word_offset
-                else:
-                    self._cumulative_audio_offset += self._current_sentence_duration
-
-            except Exception as e:
-                yield ErrorFrame(error=f"Unknown error occurred: {e}")
-                yield TTSStoppedFrame(context_id=context_id)
-                self._reset_state()
-                return
+                except Exception as e:
+                    if attempt < max_attempts - 1:
+                        logger.warning(
+                            f"{self}: Exception during synthesis (attempt {attempt + 1}/{max_attempts}), "
+                            f"recreating synthesizer and retrying: {e}"
+                        )
+                        self._recreate_synthesizer()
+                        while not self._audio_queue.empty():
+                            self._audio_queue.get_nowait()
+                            self._audio_queue.task_done()
+                        continue
+                    else:
+                        yield ErrorFrame(error=f"Azure TTS error after retry: {e}")
+                        yield TTSStoppedFrame(context_id=context_id)
+                        self._reset_state()
+                        return
 
         except Exception as e:
             yield ErrorFrame(error=f"Unknown error occurred: {e}")
