@@ -183,8 +183,14 @@ filterwarnings = [
 ]
 
 [tool.setuptools_scm]
-local_scheme = "no-local-version"
+# Kotoba fork: PEP 440 local-version segments (e.g. ``+kotoba.N``) on git tags
+# are preserved so the fork can publish ``1.1.0+kotoba.N`` and still satisfy
+# downstream constraints such as ``pipecat-ai-subagents>=1.0.0``. Upstream
+# used ``local_scheme = "no-local-version"`` which stripped the suffix. The
+# custom ``tag_regex`` captures the full PEP 440 version including the
+# ``+local`` portion so it survives the parser.
 fallback_version = "0.0.0-dev"
+tag_regex = '^v?(?P<version>\d+\.\d+\.\d+(?:[\.\-+][\w\.]+)?)$'
 
 [tool.ruff]
 exclude = [".git", "*_pb2.py"]
