@@ -10,7 +10,7 @@ This module provides an OpenAI-compatible interface for interacting with OpenRou
 extending the base OpenAI LLM service functionality.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from loguru import logger
@@ -19,7 +19,7 @@ from pydantic import BaseModel
 from pipecat.adapters.services.open_ai_adapter import OpenAILLMInvocationParams
 from pipecat.services.openai.base_llm import BaseOpenAILLMService
 from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.services.settings import assert_given
+from pipecat.services.settings import NOT_GIVEN, _NotGiven, assert_given, is_given
 
 
 class OpenRouterProviderLatencyThreshold(BaseModel):
@@ -96,7 +96,9 @@ class OpenRouterLLMSettings(BaseOpenAILLMService.Settings):
             provider selection, latency-based sorting, and filtering.
     """
 
-    provider: OpenRouterProviderPreferences | None = None
+    provider: OpenRouterProviderPreferences | None | _NotGiven = field(
+        default_factory=lambda: NOT_GIVEN
+    )
 
 
 class OpenRouterLLMService(OpenAILLMService):
@@ -134,7 +136,7 @@ class OpenRouterLLMService(OpenAILLMService):
             **kwargs: Additional keyword arguments passed to OpenAILLMService.
         """
         # 1. Initialize default_settings with hardcoded defaults
-        default_settings = self.Settings(model="openai/gpt-4o-2024-11-20")
+        default_settings = self.Settings(model="openai/gpt-4o-2024-11-20", provider=None)
 
         # 2. Apply direct init arg overrides (deprecated)
         if model is not None:
@@ -184,7 +186,7 @@ class OpenRouterLLMService(OpenAILLMService):
         """
         params = super().build_chat_completion_params(params_from_context)
 
-        if self._settings.provider is not None:
+        if is_given(self._settings.provider) and self._settings.provider is not None:
             params["provider"] = self._settings.provider.model_dump(exclude_none=True)
 
         model = assert_given(self._settings.model)
