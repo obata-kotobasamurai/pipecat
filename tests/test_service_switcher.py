@@ -143,7 +143,7 @@ class ErrorOnTextService(FrameProcessor):
 class ReinjectOnErrorStrategy(ServiceSwitcherStrategy):
     """A strategy that reinjects a replacement frame after an error."""
 
-    async def handle_error(self, error: ErrorFrame) -> Optional[FrameProcessor]:
+    async def handle_error(self, error: ErrorFrame) -> FrameProcessor | None:
         await self.reinject_downstream(TextFrame(text="retry"))
         return None
 

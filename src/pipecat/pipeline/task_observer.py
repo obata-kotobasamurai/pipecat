@@ -129,7 +129,7 @@ class TaskObserver(BaseObserver):
         for proxy in self._proxies.values():
             try:
                 await asyncio.wait_for(proxy.queue.join(), timeout=2.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
 
         for proxy in self._proxies.values():
