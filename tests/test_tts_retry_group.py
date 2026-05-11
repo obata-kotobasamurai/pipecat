@@ -7,7 +7,7 @@
 """Tests for TTS retry-group propagation across synthesis attempts."""
 
 import unittest
-from typing import AsyncGenerator
+from collections.abc import AsyncGenerator
 
 from pipecat.frames.frames import (
     AggregatedTextFrame,
