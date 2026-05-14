@@ -51,6 +51,20 @@ except ModuleNotFoundError as e:
     raise Exception(f"Missing module: {e}")
 
 
+def _merge_betas(user_betas: Any, defaults: list[str]) -> list[str]:
+    """Merge user-supplied beta headers with internal defaults, preserving order and uniqueness."""
+    merged: list[str] = []
+    seen: set[str] = set()
+    for source in (user_betas or [], defaults):
+        if isinstance(source, str):
+            source = [source]
+        for beta in source:
+            if beta and beta not in seen:
+                merged.append(beta)
+                seen.add(beta)
+    return merged
+
+
 class AnthropicThinkingConfig(BaseModel):
     """Configuration for extended thinking.
 
@@ -314,13 +328,17 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
             "messages": messages,
             "system": system,
             "tools": tools,
-            "betas": ["interleaved-thinking-2025-05-14"],
         }
         thinking = assert_given(self._settings.thinking)
         if thinking:
             params["thinking"] = thinking.model_dump(exclude_unset=True)
 
         params.update(self._settings.extra)
+
+        # Merge betas additively so settings.extra["betas"] is preserved
+        # alongside the always-on "interleaved-thinking-2025-05-14" header
+        # required for function-call thinking.
+        params["betas"] = _merge_betas(params.get("betas"), ["interleaved-thinking-2025-05-14"])
 
         # LLM completion
         response = await self._client.beta.messages.create(**params)
@@ -383,7 +401,9 @@ class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
             # "Interleaved thinking" needed to allow thinking between sequences
             # of function calls, when extended thinking is enabled.
             # Note that this requires us to use `client.beta`, below.
-            params.update({"betas": ["interleaved-thinking-2025-05-14"]})
+            # Merge with any user-supplied betas from settings.extra so that
+            # fast-mode-2026-02-01 (or other beta headers) keep working.
+            params["betas"] = _merge_betas(params.get("betas"), ["interleaved-thinking-2025-05-14"])
 
             response = await self._create_message_stream(self._client.beta.messages.create, params)
 
