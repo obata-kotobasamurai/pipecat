@@ -349,6 +349,15 @@ class TTSService(AIService):
         self._audio_contexts: dict[str, asyncio.Queue] = {}
         self._audio_context_task: asyncio.Task | None = None
 
+        # Retry-group tracking. ``retry_group_id`` is a stable identifier that
+        # survives across audio contexts so application-level retry/failover
+        # logic can correlate a re-synthesized utterance with the original one.
+        # It is registered per context here so that services emitting errors
+        # from a background receive loop (which only knows the context_id, not
+        # the originating frame) can recover the retry_group_id.
+        self._pending_retry_group_id: str | None = None
+        self._retry_group_by_context: dict[str, str] = {}
+
         # Single FIFO queue that serializes everything the TTS service emits downstream.
         # Items can be:
         #   str   – an audio context ID: process the per-context audio queue in full before
@@ -943,6 +952,10 @@ class TTSService(AIService):
         if audio_contexts:
             for ctx_id in audio_contexts:
                 await self.on_audio_context_interrupted(context_id=ctx_id)
+        # All audio contexts are dropped on interruption, so their retry-group
+        # associations are no longer needed.
+        self._retry_group_by_context.clear()
+        self._pending_retry_group_id = None
         self.reset_active_audio_context()
         self._turn_context_id = None
         self._word_last_pts = 0
@@ -1006,6 +1019,14 @@ class TTSService(AIService):
 
         # Create context ID and store metadata
         context_id = self.create_context_id()
+
+        # Register the retry group for this context so services that surface
+        # errors asynchronously (from a background receive loop) can recover the
+        # stable retry_group_id by context_id alone.
+        self._register_retry_group(
+            context_id,
+            getattr(src_frame, "retry_group_id", None) or self._pending_retry_group_id,
+        )
 
         # Skip sending to TTS if the aggregation type is in the skip list. Simply
         # push the original frame downstream.
@@ -1154,6 +1175,46 @@ class TTSService(AIService):
             # frames (e.g. code blocks) waiting behind it can be flushed in order.
             for f in self._aggregated_frame_sequencer.complete_spoken_slot():
                 await self.push_frame(f)
+
+    def _register_retry_group(self, context_id: str, retry_group_id: str | None = None) -> str:
+        """Associate a ``retry_group_id`` with a TTS audio context.
+
+        Falls back to using the ``context_id`` itself as the group id when no
+        explicit ``retry_group_id`` is provided, guaranteeing a stable, non-None
+        value for downstream retry tracking.
+
+        Args:
+            context_id: The audio context id being created.
+            retry_group_id: Optional stable utterance id from the originating frame.
+
+        Returns:
+            The resolved retry group id stored for this context.
+        """
+        retry_group = retry_group_id or context_id
+        self._retry_group_by_context[context_id] = retry_group
+        return retry_group
+
+    def _retry_group_for_context(self, context_id: str | None) -> str | None:
+        """Return the ``retry_group_id`` registered for a context, if any.
+
+        Args:
+            context_id: The audio context id to look up.
+
+        Returns:
+            The registered retry group id, or None if the context is unknown.
+        """
+        if not context_id:
+            return None
+        return self._retry_group_by_context.get(context_id)
+
+    def _cleanup_retry_group(self, context_id: str | None):
+        """Drop the retry-group association for a finished/interrupted context.
+
+        Args:
+            context_id: The audio context id whose association should be removed.
+        """
+        if context_id:
+            self._retry_group_by_context.pop(context_id, None)
 
     async def tts_process_generator(
         self,
@@ -1479,6 +1540,7 @@ class TTSService(AIService):
 
                 # We just finished processing the context, so we can safely remove it.
                 del self._audio_contexts[context_id]
+                self._cleanup_retry_group(context_id)
                 await self.on_audio_context_completed(context_id=context_id)
                 self.reset_active_audio_context()
             else:
