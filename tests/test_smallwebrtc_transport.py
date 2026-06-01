@@ -214,5 +214,63 @@ class TestReadVideoFrameMediaStreamError(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(yielded, 2)
 
 
+class TestSmallWebRTCDTMFInput(unittest.IsolatedAsyncioTestCase):
+    """`_on_app_message` converts data-channel DTMF messages to InputDTMFFrame.
+
+    A message shaped ``{"type": "dtmf", "digit": "1"}`` must be turned into an
+    ``InputDTMFFrame`` and pushed into the pipeline (not forwarded as a generic
+    app message). Invalid digits are dropped with a warning, and non-DTMF
+    messages still flow through ``push_app_message``.
+    """
+
+    def _make_self(self):
+        from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
+
+        fake = MagicMock(spec=SmallWebRTCTransport)
+        fake._input = MagicMock()
+        fake._input.push_frame = AsyncMock()
+        fake._input.push_app_message = AsyncMock()
+        fake._call_event_handler = AsyncMock()
+        return fake
+
+    async def test_valid_dtmf_pushed_as_frame(self):
+        from pipecat.frames.frames import InputDTMFFrame
+        from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
+
+        fake = self._make_self()
+        await SmallWebRTCTransport._on_app_message(
+            fake, {"type": "dtmf", "digit": "1"}, sender="peer"
+        )
+
+        fake._input.push_frame.assert_awaited_once()
+        pushed = fake._input.push_frame.await_args.args[0]
+        self.assertIsInstance(pushed, InputDTMFFrame)
+        # DTMF is intercepted: it must NOT be forwarded as a generic app message.
+        fake._input.push_app_message.assert_not_awaited()
+
+    async def test_invalid_dtmf_digit_dropped(self):
+        from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
+
+        fake = self._make_self()
+        await SmallWebRTCTransport._on_app_message(
+            fake, {"type": "dtmf", "digit": "X"}, sender="peer"
+        )
+
+        # Invalid digit raises ValueError internally and is swallowed.
+        fake._input.push_frame.assert_not_awaited()
+        fake._input.push_app_message.assert_not_awaited()
+
+    async def test_non_dtmf_message_forwarded(self):
+        from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
+
+        fake = self._make_self()
+        msg = {"type": "something-else", "payload": 42}
+        await SmallWebRTCTransport._on_app_message(fake, msg, sender="peer")
+
+        fake._input.push_frame.assert_not_awaited()
+        fake._input.push_app_message.assert_awaited_once_with(msg)
+        fake._call_event_handler.assert_awaited_once()
+
+
 if __name__ == "__main__":
     unittest.main()
