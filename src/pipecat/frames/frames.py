@@ -1881,6 +1881,24 @@ class TTSStoppedFrame(ControlFrame):
 
 
 @dataclass
+class TTSSentenceBoundaryFrame(ControlFrame):
+    """Frame indicating a sentence boundary in TTS output.
+
+    Pushed after all audio frames for a sentence have been pushed, signaling
+    that a complete sentence worth of TTS audio has been delivered. This can be
+    used by downstream processors (e.g. caching mixins) to finalize per-sentence
+    audio buffers.
+
+    Parameters:
+        context_id: Unique identifier for this TTS context.
+        text: The sentence text that was just synthesized.
+    """
+
+    context_id: str | None = None
+    text: str | None = None
+
+
+@dataclass
 class TTSErrorFrame(ErrorFrame):
     """Error frame emitted when TTS synthesis fails.
 
