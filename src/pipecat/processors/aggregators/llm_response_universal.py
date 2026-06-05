@@ -1701,7 +1701,7 @@ class LLMAssistantAggregator(LLMContextAggregator):
                 else:
                     run_llm = True
 
-        if run_llm and not self._user_speaking:
+        if run_llm:
             await self._maybe_push_context_after_function_result()
 
         # Call the `on_context_updated` callback once the function call result
@@ -1732,18 +1732,15 @@ class LLMAssistantAggregator(LLMContextAggregator):
             logger.debug(
                 f"{self}: More FunctionCallResultFrames queued — deferring context frame push."
             )
-        elif self._bot_speaking:
-            # Defer the context frame push until the bot finishes speaking. If multiple
-            # function call results arrive while the bot is speaking, they all accumulate
-            # in the context and a single push is performed once speaking stops, preventing
-            # the LLM from running multiple times and producing duplicated responses.
-            # This should be an edge case, since it would require a FunctionCallResultFrame
-            # being queued between an LLM response start and end frame.
-            logger.debug(f"{self}: Bot is speaking — deferring context frame push.")
-            self._push_context_on_bot_stopped_speaking = True
-        else:
-            logger.debug(f"{self}: Pushing context frame!")
-            await self.push_context_frame(FrameDirection.UPSTREAM)
+            return
+        # Re-run inference as soon as the tool result is in context, even if the
+        # bot or user is currently speaking. Deferring on speech state silently
+        # drops the re-trigger (the bot-speaking deferral flag is cleared by the
+        # assistant-message commit; the user-speaking gate has no recovery), which
+        # leaves the bot mute after a tool call → idle hangup. Barge-in still
+        # cancels the bot if the user keeps talking over the response.
+        logger.debug(f"{self}: Pushing context frame after function result!")
+        await self.push_context_frame(FrameDirection.UPSTREAM)
 
     async def _handle_function_call_intermediate_result(
         self, frame: FunctionCallResultFrame, in_progress_frame: FunctionCallInProgressFrame
