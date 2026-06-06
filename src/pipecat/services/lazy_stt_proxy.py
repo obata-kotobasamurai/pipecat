@@ -91,10 +91,16 @@ class LazySTTProxy(FrameProcessor):
         """Create the STT service and initialize it with the saved StartFrame."""
         logger.info(f"{self} lazily initializing STT service")
         self._stt = self._factory()
-        # Set up the internal STT with the same pipeline infrastructure
+        # Set up the internal STT with the same pipeline infrastructure.
+        # pipeline_worker became a required field of FrameProcessorSetup; the
+        # proxy itself is already set up, so reuse its worker for the wrapped
+        # STT. Without this the lazy STT crashes on first audio with
+        # "FrameProcessorSetup.__init__() missing 1 required positional
+        # argument: 'pipeline_worker'", taking down the whole failover chain.
         setup = FrameProcessorSetup(
             clock=self._clock,
             task_manager=self._task_manager,
+            pipeline_worker=self._pipeline_worker,
             observer=self._observer,
         )
         await self._stt.setup(setup)
