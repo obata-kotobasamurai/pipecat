@@ -23,6 +23,7 @@ from pipecat.frames.frames import (
     InterimTranscriptionFrame,
     StartFrame,
     TranscriptionFrame,
+    UserStoppedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
@@ -594,6 +595,18 @@ class SonioxSTTService(WebsocketSTTService):
                 await self._handle_transcription(text, is_final=True, language=language)
                 await self.stop_processing_metrics()
                 self._final_transcription_buffer = []
+
+                # In native endpoint mode (vad_force_turn_endpoint=False) Soniox's
+                # own semantic endpoint detection decides when the user's turn has
+                # ended (the `<end>` token). Broadcast a UserStoppedSpeakingFrame so
+                # downstream turn controllers (e.g. ExternalUserTurnStopStrategy) can
+                # treat the Soniox endpoint as the end-of-turn signal -- mirroring how
+                # Deepgram Flux / Cartesia STT and the LiveKit Soniox plugin emit an
+                # end-of-speech event on their native endpoint. When VAD drives
+                # finalization (vad_force_turn_endpoint=True) the VAD already emits the
+                # stop signal, so we must not double-fire here.
+                if not self._vad_force_turn_endpoint:
+                    await self.broadcast_frame(UserStoppedSpeakingFrame)
 
         async for message in self._get_websocket():
             try:
