@@ -302,13 +302,32 @@ class WordCompletionTracker:
             elif chars_for_frame == 0:
                 # Non-alnum word (emoji, punctuation, symbol): segment map advance(0)
                 # is a no-op. Consume the raw word from llm_text, skipping any leading
-                # spaces that belong to the previous token's span.
+                # spaces that belong to the previous token's span — but only when the
+                # span at the cursor really corresponds to this word. A blind
+                # `len(word)`-char consume here desyncs the cursor for every later word
+                # when the symbol does not actually live at the cursor (e.g. a
+                # sentence-final "。" mis-routed from an already-completed neighbouring
+                # frame would swallow the first character of this frame's llm_text).
+                # (kotoba custom, ported from 9415d81a onto v1.5.0's segment-map tracker)
                 start = self._llm_pos
                 while start < len(self._llm_text) and self._llm_text[start].isspace():
                     start += 1
                 end = start + len(word)
-                self._llm_consumed = self._llm_text[start:end]
-                self._llm_pos = end
+                candidate = self._llm_text[start:end]
+                is_literal_match = self._fold_typography(candidate) == self._fold_typography(word)
+                # Symbol substitution (e.g. ElevenLabs reports "→" as "-"): accept a
+                # non-matching span only when it contains no alphanumeric chars itself.
+                is_symbol_substitution = bool(candidate) and not any(c.isalnum() for c in candidate)
+                if is_literal_match or is_symbol_substitution:
+                    self._llm_consumed = candidate
+                    self._llm_pos = end
+                else:
+                    logger.warning(
+                        f"WordCompletionTracker: symbol word {word!r} has no "
+                        f"counterpart at llm_text cursor (found {candidate!r}), "
+                        "skipping llm consumption"
+                    )
+                    self._llm_consumed = None
             elif self._segment_map.in_transformed_segment:
                 # Mid transformed segment: suppress per-word attribution.
                 self._llm_consumed = None
