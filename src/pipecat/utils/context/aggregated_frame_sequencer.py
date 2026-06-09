@@ -166,6 +166,30 @@ class AggregatedFrameSequencer:
         is_complete = False
         raw_overflow_word = None
 
+        # A symbol-only word (normalizes to nothing — punctuation, emoji) that no
+        # slot claims is most commonly a trailing-punctuation timestamp event
+        # arriving *after* its slot already completed (completion is driven by
+        # alnum counts, so e.g. Cartesia's sentence-final "。" lands here every
+        # sentence). The slot's llm_text consumption already included that
+        # punctuation, so appending the passthrough to the context would
+        # duplicate it ("…ですか？？"). Emit it for word-timestamp consumers but
+        # keep it out of the context.
+        is_symbol_only = not WordCompletionTracker._normalize(word)
+
+        if active is None and is_symbol_only:
+            logger.debug(
+                f"{self._name} Symbol word '{word}' arrived with no active slot, "
+                "emitting as non-context passthrough"
+            )
+            frame = self._build_word_frame(
+                word,
+                pts,
+                context_id,
+                includes_inter_frame_spaces=includes_inter_frame_spaces,
+            )
+            frame.append_to_context = False
+            return [frame]
+
         if active and active.tracker:
             if not active.tracker.word_belongs_here(word):
                 next_slot = self._get_next_active_slot(active)
@@ -175,18 +199,20 @@ class AggregatedFrameSequencer:
                     and next_slot.tracker.word_belongs_here(word)
                 )
                 if not word_fits_next:
-                    logger.warning(
+                    log = logger.debug if is_symbol_only else logger.warning
+                    log(
                         f"{self._name} Word '{word}' not recognised by any slot, "
                         "emitting as passthrough"
                     )
-                    return [
-                        self._build_word_frame(
-                            word,
-                            pts,
-                            context_id,
-                            includes_inter_frame_spaces=includes_inter_frame_spaces,
-                        )
-                    ]
+                    frame = self._build_word_frame(
+                        word,
+                        pts,
+                        context_id,
+                        includes_inter_frame_spaces=includes_inter_frame_spaces,
+                    )
+                    if is_symbol_only:
+                        frame.append_to_context = False
+                    return [frame]
 
             is_complete = active.tracker.add_word_and_check_complete(word)
             raw_overflow_word = active.tracker.get_overflow_word()

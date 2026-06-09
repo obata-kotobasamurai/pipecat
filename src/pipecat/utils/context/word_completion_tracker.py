@@ -303,14 +303,39 @@ class WordCompletionTracker:
                 self._llm_pos = len(self._llm_text)
             else:
                 if chars_for_frame == 0:
-                    # Consume exactly the raw word in llm_text, skipping any
-                    # leading spaces that belong to the previous token's span.
+                    # Symbol-only word (no alnum content). Consume the raw word
+                    # from llm_text, skipping any leading spaces that belong to
+                    # the previous token's span — but only when the span at the
+                    # cursor really corresponds to this word. A blind
+                    # `len(word)`-char consume here desyncs the cursor for every
+                    # later word when the symbol does not actually live at the
+                    # cursor (e.g. a sentence-final "。" mis-routed from an
+                    # already-completed neighbouring frame would swallow the
+                    # first character of this frame's llm_text).
                     start = self._llm_pos
                     while start < len(self._llm_text) and self._llm_text[start].isspace():
                         start += 1
                     end = start + len(word)
-                    self._llm_consumed = self._llm_text[start:end]
-                    self._llm_pos = end
+                    candidate = self._llm_text[start:end]
+                    is_literal_match = self._fold_typography(candidate) == self._fold_typography(
+                        word
+                    )
+                    # Symbol substitution (e.g. ElevenLabs reports "→" as "-"):
+                    # accept a non-matching span only when it contains no
+                    # alphanumeric characters itself.
+                    is_symbol_substitution = bool(candidate) and not any(
+                        c.isalnum() for c in candidate
+                    )
+                    if is_literal_match or is_symbol_substitution:
+                        self._llm_consumed = candidate
+                        self._llm_pos = end
+                    else:
+                        logger.warning(
+                            f"WordCompletionTracker: symbol word {word!r} has no "
+                            f"counterpart at llm_text cursor (found {candidate!r}), "
+                            "skipping llm consumption"
+                        )
+                        self._llm_consumed = None
                 else:
                     # Advance through llm_text by exactly chars_for_frame alphanumeric
                     # chars. Non-alnum chars (spaces, opening tags) are included in the
@@ -328,7 +353,7 @@ class WordCompletionTracker:
             # expected text, since some TTS services may add punctuation to
             # the raw text.
             word_without_punctuation = self._remove_trailing_punctuation(self._frame_word)
-            if word_without_punctuation and self._fold_typography(
+            if word_without_punctuation and self._llm_consumed is not None and self._fold_typography(
                 word_without_punctuation
             ) not in self._fold_typography(self._llm_consumed):
                 logger.warning(
@@ -388,6 +413,14 @@ class WordCompletionTracker:
            as ``-``), so check 1 always fails even though the word belongs here. If alnum
            content still remains unconsumed and the next non-space character in the TTS
            text is itself a non-alnum symbol, accept the word as a substitution.
+
+        The literal search in check 1 is bounded to the *cursor region*: from just
+        before the cursor (backing up over punctuation already skipped by
+        ``_advance_by_alnums``) up to the next alphanumeric character. Searching the
+        entire remaining text would wrongly claim symbols that belong elsewhere —
+        e.g. a sentence-final ``。`` arriving after the previous frame completed
+        would match the trailing ``。`` of this (entirely unspoken) frame, and the
+        subsequent llm_text consumption would corrupt the cursor.
         """
         search_start = self._tts_pos
         while search_start > 0:
@@ -395,7 +428,17 @@ class WordCompletionTracker:
             if ch.isalnum() or ch.isspace() or ch == ">":
                 break
             search_start -= 1
-        if word in self._tts_text[search_start:]:
+        search_end = self._tts_pos
+        while search_end < len(self._tts_text):
+            ch = self._tts_text[search_end]
+            if ch == "<":
+                close = self._tts_text.find(">", search_end)
+                search_end = close + 1 if close != -1 else search_end + 1
+                continue
+            if ch.isalnum():
+                break
+            search_end += 1
+        if word in self._tts_text[search_start:search_end]:
             return True
 
         if len(self._received) >= len(self._tts_normalized):

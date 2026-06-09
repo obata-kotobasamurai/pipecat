@@ -112,12 +112,23 @@ class TestWordCompletionTrackerNormalization(unittest.TestCase):
         self.assertTrue(tracker.is_complete)
         self.assertEqual(tracker.get_overflow_word(), "---")
 
-        # "..." IS in "hello..." so it belongs here and contributes 0 alnum chars
+        # "..." appears only AFTER unspoken alnum content ("hello...") — it does
+        # not belong at the cursor region, so it must NOT match (matching far-ahead
+        # trailing punctuation is how a mis-routed sentence-final "。" used to
+        # corrupt the llm cursor). word_belongs_here is False → force-complete.
         tracker2 = WordCompletionTracker("hello...")
-        tracker2.add_word_and_check_complete("...")  # belongs, but no alnum chars → incomplete
-        self.assertFalse(tracker2.is_complete)
-        tracker2.add_word_and_check_complete("hello")
+        self.assertFalse(tracker2.word_belongs_here("..."))
+        tracker2.add_word_and_check_complete("...")
         self.assertTrue(tracker2.is_complete)
+        self.assertEqual(tracker2.get_overflow_word(), "...")
+
+        # Leading punctuation at the cursor region DOES belong.
+        tracker3 = WordCompletionTracker("...hello")
+        self.assertTrue(tracker3.word_belongs_here("..."))
+        tracker3.add_word_and_check_complete("...")  # belongs, but no alnum chars → incomplete
+        self.assertFalse(tracker3.is_complete)
+        tracker3.add_word_and_check_complete("hello")
+        self.assertTrue(tracker3.is_complete)
 
     def test_ssml_tags_stripped_in_word(self):
         """SSML tags like <spell>...</spell> in TTS word tokens are stripped before comparison."""
@@ -1596,6 +1607,72 @@ class TestWordCompletionTrackerCJK(unittest.TestCase):
         tracker = WordCompletionTracker(sentence)
         tracker.add_word_and_check_complete("你好，我是")
         self.assertEqual(tracker.get_remaining_tts_text(), "你的智能")
+
+
+class TestWordCompletionTrackerMisroutedPunctuation(unittest.TestCase):
+    """Regression tests: a sentence-final punctuation token mis-routed into the
+    NEXT sentence's tracker must not corrupt the llm_text cursor.
+
+    Production bug (Cartesia, Japanese): completion is alnum-count driven, so the
+    sentence-final "。" timestamp event always arrives after its slot completed
+    and was flushed. The next sentence's tracker then (a) wrongly claimed the
+    token because its own trailing "。" matched anywhere in the remaining text,
+    and (b) consumed len("。") raw chars from llm_text — swallowing the first
+    character of the sentence. Every later word's llm span was then off by one
+    and discarded, and the assistant context fell back to spoken words, doubling
+    the first character of every sentence ("山田養蜂場…" → "山山田養蜂場…").
+    """
+
+    def test_sentence_final_period_does_not_belong_to_fresh_next_tracker(self):
+        tracker = WordCompletionTracker(
+            "山田養蜂場お客様窓口でございます。",
+            llm_text="山田養蜂場お客様窓口でございます。",
+        )
+        self.assertFalse(tracker.word_belongs_here("。"))
+
+    def test_symbol_word_does_not_consume_alnum_llm_text(self):
+        """Even if a symbol token reaches add_word (force-complete path), the llm
+        cursor must not swallow alphanumeric content that doesn't match it."""
+        tracker = WordCompletionTracker(
+            "山田養蜂場。",
+            llm_text="山田養蜂場。",
+        )
+        tracker.add_word_and_check_complete("。")
+        # Force-complete sweeps the slot, but the consumed span must never be a
+        # corrupt slice like "山".
+        self.assertNotEqual(tracker.get_llm_consumed(), "山")
+
+    def test_words_stay_aligned_after_leading_symbol_skip(self):
+        """A leading symbol that matches nothing must leave the cursor untouched
+        so subsequent words still map to their correct llm spans."""
+        tracker = WordCompletionTracker(
+            "...山田養蜂場",
+            llm_text="→山田養蜂場",
+        )
+        # "..." belongs (leading punctuation at cursor) but its 3-char raw slice
+        # in llm_text ("→山田") contains alphanumeric content — consuming it
+        # would swallow "山田". The tracker must skip consumption; the symbol
+        # then rides along in the next word's span.
+        tracker.add_word_and_check_complete("...")
+        self.assertIsNone(tracker.get_llm_consumed())
+        tracker.add_word_and_check_complete("山田")
+        self.assertEqual(tracker.get_llm_consumed(), "→山田")
+        tracker.add_word_and_check_complete("養蜂場")
+        self.assertEqual(tracker.get_llm_consumed(), "養蜂場")
+
+    def test_symbol_substitution_still_consumes_symbol_span(self):
+        """ElevenLabs-style substitution: "→" reported as "-" still maps to the
+        original symbol span in llm_text."""
+        tracker = WordCompletionTracker(
+            "go - now",
+            llm_text="go → now",
+        )
+        tracker.add_word_and_check_complete("go")
+        self.assertEqual(tracker.get_llm_consumed(), "go")
+        tracker.add_word_and_check_complete("-")
+        self.assertEqual(tracker.get_llm_consumed(), "→")
+        tracker.add_word_and_check_complete("now")
+        self.assertEqual(tracker.get_llm_consumed(), "now")
 
 
 if __name__ == "__main__":
