@@ -833,5 +833,72 @@ class TestCJKProcessWordFlagPropagation(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# process_word — mis-routed sentence-final punctuation (Cartesia JA regression)
+# ---------------------------------------------------------------------------
+
+
+class TestProcessWordMisroutedSentencePunctuation(unittest.TestCase):
+    """Regression: Cartesia emits sentence-final punctuation ("。", "？") as its
+    own word-timestamp event. Completion is alnum-count driven, so that event
+    always arrives AFTER its slot completed and was flushed. It must neither be
+    claimed by the next sentence's tracker (corrupting the llm cursor → first
+    char of every sentence doubled in context) nor be appended to the context
+    as a passthrough (duplicating punctuation, e.g. "…ですか？？")."""
+
+    @staticmethod
+    def _context_text(frames) -> str:
+        parts = []
+        for f in frames:
+            if isinstance(f, TTSTextFrame) and f.append_to_context:
+                parts.append(f.raw_text if f.raw_text else f.text)
+        return "".join(parts)
+
+    def test_two_japanese_sentences_context_not_corrupted(self):
+        s1 = "お電話ありがとうございます。"
+        s2 = "山田養蜂場お客様窓口でございます。"
+        seq = _seq()
+        seq.register_spoken(_spoken_frame(s1), "ctx1", _tracker(s1, llm_text=s1), True)
+        seq.register_spoken(_spoken_frame(s2), "ctx2", _tracker(s2, llm_text=s2), True)
+
+        frames = []
+        # Sentence 1 words; the final alnum word completes and flushes the slot.
+        frames += seq.process_word("お電話", pts=1, context_id="ctx1")
+        frames += seq.process_word("ありがとうございます", pts=2, context_id="ctx1")
+        # Trailing "。" arrives late — slot 1 is gone, must NOT claim slot 2.
+        frames += seq.process_word("。", pts=3, context_id="ctx1")
+        # Sentence 2 words must still map to their correct llm spans.
+        frames += seq.process_word("山田養蜂場", pts=4, context_id="ctx2")
+        frames += seq.process_word("お客様窓口", pts=5, context_id="ctx2")
+        frames += seq.process_word("でございます", pts=6, context_id="ctx2")
+        frames += seq.process_word("。", pts=7, context_id="ctx2")
+
+        self.assertEqual(self._context_text(frames), s1 + s2)
+
+    def test_late_punctuation_with_no_slots_is_not_appended_to_context(self):
+        sentence = "まだお電話口にいらっしゃいますでしょうか？"
+        seq = _seq()
+        seq.register_spoken(
+            _spoken_frame(sentence), "ctx1", _tracker(sentence, llm_text=sentence), True
+        )
+        frames = []
+        frames += seq.process_word("まだお電話口にいらっしゃいますでしょうか", pts=1, context_id="ctx1")
+        # Queue is now empty; the trailing "？" must still be emitted (for
+        # word-timestamp consumers) but not appended to the context.
+        late = seq.process_word("？", pts=2, context_id="ctx1")
+        frames += late
+
+        self.assertEqual(len(late), 1)
+        self.assertFalse(late[0].append_to_context)
+        self.assertEqual(self._context_text(frames), sentence)
+
+    def test_alnum_passthrough_still_appends_to_context(self):
+        """Real spoken content with no matching slot must keep current behavior
+        (append) — only symbol-only tokens are kept out of the context."""
+        seq = _seq()
+        result = seq.process_word("hello", pts=1, context_id="ctx-unknown")
+        self.assertTrue(result[0].append_to_context)
+
+
 if __name__ == "__main__":
     unittest.main()
