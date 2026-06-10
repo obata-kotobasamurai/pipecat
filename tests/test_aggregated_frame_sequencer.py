@@ -882,7 +882,9 @@ class TestProcessWordMisroutedSentencePunctuation(unittest.TestCase):
             _spoken_frame(sentence), "ctx1", _tracker(sentence, llm_text=sentence), True
         )
         frames = []
-        frames += seq.process_word("まだお電話口にいらっしゃいますでしょうか", pts=1, context_id="ctx1")
+        frames += seq.process_word(
+            "まだお電話口にいらっしゃいますでしょうか", pts=1, context_id="ctx1"
+        )
         # Queue is now empty; the trailing "？" must still be emitted (for
         # word-timestamp consumers) but not appended to the context.
         late = seq.process_word("？", pts=2, context_id="ctx1")

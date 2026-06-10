@@ -376,9 +376,12 @@ class WordCompletionTracker:
             # previous word's trailing sweep already consumed them — discarding
             # there would duplicate the symbol via the frame-text fallback.
             word_without_punctuation = self._strip_edge_symbols(self._frame_word)
-            if word_without_punctuation and self._llm_consumed is not None and self._fold_typography(
+            if (
                 word_without_punctuation
-            ) not in self._fold_typography(self._llm_consumed):
+                and self._llm_consumed is not None
+                and self._fold_typography(word_without_punctuation)
+                not in self._fold_typography(self._llm_consumed)
+            ):
                 logger.warning(
                     f"WordCompletionTracker: llm_consumed {repr(self._llm_consumed)!s} "
                     f"does not contain frame_word {repr(self._frame_word)!s}, discarding"

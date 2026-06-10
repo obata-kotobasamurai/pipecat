@@ -427,8 +427,9 @@ class AggregatedFrameSequencer:
         )
         # Same dedup rule as process_word: a symbol-only overflow whose llm
         # consumption was skipped is already carried by an adjacent span.
-        if next_active.tracker.last_symbol_consumption_skipped and not WordCompletionTracker._normalize(
-            raw_overflow_word
+        if (
+            next_active.tracker.last_symbol_consumption_skipped
+            and not WordCompletionTracker._normalize(raw_overflow_word)
         ):
             frames[-1].append_to_context = False
         if overflow_complete:
