@@ -55,6 +55,21 @@ def test_cartesia_japanese_word_timestamps_join_without_spaces():
     ) == [("こんにちは。", 0.0)]
 
 
+def test_cartesia_japanese_word_timestamps_strip_tag_split_across_characters():
+    # Cartesia delivers CJK timestamps character-by-character, so an SSML tag
+    # like <emotion value="happy"/> arrives as fragments ("<", "e", "m", ...)
+    # that only form a strippable tag once joined.
+    words = list('<emotion value="happy"/>') + list("ありがとう。")
+    starts = [i * 0.1 for i in range(len(words))]
+    assert _process_word_timestamps(words, starts, language="ja") == [("ありがとう。", 0.0)]
+
+
+def test_cartesia_japanese_word_timestamps_drop_tag_only_message():
+    words = list('<emotion value="sympathetic"/>')
+    starts = [i * 0.1 for i in range(len(words))]
+    assert _process_word_timestamps(words, starts, language="ja") == []
+
+
 def test_cartesia_korean_word_timestamps_preserve_words_and_timestamps():
     assert _process_word_timestamps(
         words=["안녕하세요", "반갑습니다"],
