@@ -112,6 +112,11 @@ class WordCompletionTracker:
         self._overflow_word: str | None = None
         self._llm_consumed: str | None = None
         self._frame_word: str | None = None
+        # True when the last added word was a symbol-only token whose llm consumption
+        # was skipped (punctuation already carried by an adjacent word's span). Routed
+        # into suppress_in_context() so the sequencer emits it with
+        # append_to_context=False. (kotoba custom, ported from bed06035.)
+        self._last_symbol_consumption_skipped = False
 
         self._segment_map = TextSegmentMap(tts_text, self._user_facing_text, llm_text)
 
@@ -150,6 +155,27 @@ class WordCompletionTracker:
         while i > 0 and unicodedata.category(text[i - 1]).startswith("P"):
             i -= 1
         return text[:i]
+
+    @staticmethod
+    def _strip_edge_symbols(text: str) -> str:
+        """Strip XML/HTML tags, then non-alphanumeric characters from both ends.
+
+        Used to compare a TTS frame word against its llm_text span. TTS providers
+        may attach punctuation/symbols to either side of a word (e.g. ``"~夜9時の"``)
+        while the corresponding llm span starts after that symbol because the previous
+        word's trailing-punctuation sweep already consumed it. Only the alphanumeric
+        core is meaningful for the containment check — edge symbols on either side must
+        not cause the span to be discarded (which would duplicate the symbol via the
+        frame-text fallback, e.g. "朝9時~~夜9時"). (kotoba custom, ported from bed06035.)
+        """
+        text = re.sub(r"<[^>]+>", "", text)
+        start = 0
+        end = len(text)
+        while start < end and not text[start].isalnum():
+            start += 1
+        while end > start and not text[end - 1].isalnum():
+            end -= 1
+        return text[start:end]
 
     @staticmethod
     def _advance_by_alnums(text: str, start_pos: int, n: int) -> int:
@@ -208,6 +234,7 @@ class WordCompletionTracker:
         self._overflow_word = None
         self._llm_consumed = None
         self._frame_word = None
+        self._last_symbol_consumption_skipped = False
 
         if prev_len > expected_len:
             logger.warning(f"{self}, trying to add a word in an already complete frame")
@@ -231,7 +258,7 @@ class WordCompletionTracker:
                 # Also removing punctuation from the frame word to match the
                 # expected text, since some TTS services may add punctuation to
                 # the raw text.
-                word_without_punctuation = self._remove_trailing_punctuation(self._frame_word)
+                word_without_punctuation = self._strip_edge_symbols(self._frame_word)
                 if word_without_punctuation and word_without_punctuation not in self._llm_consumed:
                     logger.warning(
                         f"WordCompletionTracker: force-complete llm_consumed {repr(self._llm_consumed)!s} "
@@ -287,7 +314,7 @@ class WordCompletionTracker:
                 # completing word finishes a transformed segment — the spoken word
                 # (e.g. "dollars") won't appear verbatim in the original ("$5").
                 completed = self._segment_map.last_completed_segment
-                word_without_punctuation = self._remove_trailing_punctuation(self._frame_word)
+                word_without_punctuation = self._strip_edge_symbols(self._frame_word)
                 if (
                     word_without_punctuation
                     and (completed is None or not completed.is_transformed)
@@ -322,12 +349,19 @@ class WordCompletionTracker:
                     self._llm_consumed = candidate
                     self._llm_pos = end
                 else:
-                    logger.warning(
+                    # The symbol was already consumed elsewhere — most commonly as the
+                    # trailing-punctuation sweep of the previous word's span (Cartesia ja
+                    # delivers e.g. a mid-frame "、" as its own timestamp event after the
+                    # preceding chunk). Expected for such providers, hence debug not
+                    # warning. Flag it so suppress_in_context() keeps the re-sent symbol
+                    # out of the context (avoids "ご用件、、"). (kotoba custom, bed06035.)
+                    logger.debug(
                         f"WordCompletionTracker: symbol word {word!r} has no "
                         f"counterpart at llm_text cursor (found {candidate!r}), "
                         "skipping llm consumption"
                     )
                     self._llm_consumed = None
+                    self._last_symbol_consumption_skipped = True
             elif self._segment_map.in_transformed_segment:
                 # Mid transformed segment: suppress per-word attribution.
                 self._llm_consumed = None
@@ -337,7 +371,7 @@ class WordCompletionTracker:
                 completed = self._segment_map.last_completed_segment
                 if completed is None or not completed.is_transformed:
                     # Unchanged segment: validate the span contains the frame word.
-                    word_without_punctuation = self._remove_trailing_punctuation(self._frame_word)
+                    word_without_punctuation = self._strip_edge_symbols(self._frame_word)
                     if word_without_punctuation and self._fold_typography(
                         word_without_punctuation
                     ) not in self._fold_typography(self._llm_consumed):
@@ -424,7 +458,7 @@ class WordCompletionTracker:
         written to the conversation context. Only the completing word of the segment
         carries ``raw_text`` with the original text (e.g. ``"$42.50"``).
         """
-        return self._segment_map.in_transformed_segment
+        return self._segment_map.in_transformed_segment or self._last_symbol_consumption_skipped
 
     def get_word_for_frame(self) -> str | None:
         """Return the portion of the last word that belongs to this frame.
@@ -527,4 +561,5 @@ class WordCompletionTracker:
         self._overflow_word = None
         self._llm_consumed = None
         self._frame_word = None
+        self._last_symbol_consumption_skipped = False
         self._segment_map.reset()
