@@ -461,9 +461,12 @@ class CartesiaTTSService(WebsocketTTSService):
         # Check if this is a Chinese/Japanese language (if language is None, treat as other)
         if current_language and self._is_chinese_or_japanese_language(current_language):
             # For Chinese/Japanese, combine all characters in this message into one word
-            # using the first character's start time.
+            # using the first character's start time. Strip tags after combining:
+            # Cartesia delivers CJK timestamps character-by-character, so an SSML tag
+            # arrives as fragments ("<", "e", "m", ...) that only form a strippable
+            # tag once joined.
             if words and starts:
-                combined_word = "".join(self._strip_cartesia_tags(w) for w in words)
+                combined_word = self._strip_cartesia_tags("".join(words))
                 first_start = starts[0]
                 return [(combined_word, first_start)] if combined_word else []
             else:
