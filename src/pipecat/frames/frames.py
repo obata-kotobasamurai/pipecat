@@ -1914,8 +1914,8 @@ class TTSErrorFrame(ErrorFrame):
     """
 
     text: str = ""
-    tts_context_id: Optional[str] = None
-    retry_group_id: Optional[str] = None
+    tts_context_id: str | None = None
+    retry_group_id: str | None = None
 
 
 @dataclass

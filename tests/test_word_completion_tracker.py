@@ -1675,5 +1675,84 @@ class TestWordCompletionTrackerMisroutedPunctuation(unittest.TestCase):
         self.assertEqual(tracker.get_llm_consumed(), "now")
 
 
+class TestMidFrameStandaloneSymbolSkipFlag(unittest.TestCase):
+    """last_symbol_consumption_skipped marks symbol tokens whose llm consumption
+    was skipped because the punctuation was already swept into the previous
+    word's span — callers keep those out of the conversation context."""
+
+    def test_flag_set_when_symbol_already_swept_into_previous_span(self):
+        tracker = WordCompletionTracker(
+            "ご用件、お電話番号をお願いします。",
+            llm_text="ご用件、お電話番号をお願いします。",
+        )
+        tracker.add_word_and_check_complete("ご用件")
+        self.assertEqual(tracker.get_llm_consumed(), "ご用件、")
+        self.assertFalse(tracker.last_symbol_consumption_skipped)
+
+        tracker.add_word_and_check_complete("、")
+        self.assertIsNone(tracker.get_llm_consumed())
+        self.assertTrue(tracker.last_symbol_consumption_skipped)
+
+        # The flag must reset on the next word.
+        tracker.add_word_and_check_complete("お電話番号をお願いします")
+        self.assertFalse(tracker.last_symbol_consumption_skipped)
+        self.assertEqual(tracker.get_llm_consumed(), "お電話番号をお願いします。")
+
+    def test_flag_not_set_for_symbol_consumed_at_cursor(self):
+        tracker = WordCompletionTracker("、どうぞ", llm_text="、どうぞ")
+        tracker.add_word_and_check_complete("、")
+        self.assertEqual(tracker.get_llm_consumed(), "、")
+        self.assertFalse(tracker.last_symbol_consumption_skipped)
+
+    def test_flag_not_set_for_symbol_substitution(self):
+        tracker = WordCompletionTracker("go - now", llm_text="go → now")
+        tracker.add_word_and_check_complete("go")
+        tracker.add_word_and_check_complete("-")
+        self.assertEqual(tracker.get_llm_consumed(), "→")
+        self.assertFalse(tracker.last_symbol_consumption_skipped)
+
+
+class TestEdgeSymbolTolerantSpanGuard(unittest.TestCase):
+    """The llm-span contains-guard must tolerate symbols attached to either edge
+    of the raw TTS word ("~夜9時の", "（カタカナ）をお") — the llm span
+    legitimately lacks the leading symbol because the previous word's
+    trailing-punctuation sweep already consumed it. Discarding the span makes
+    the context fall back to the frame text, duplicating the symbol."""
+
+    def test_leading_tilde_attached_to_next_word_keeps_span(self):
+        tracker = WordCompletionTracker(
+            "受付時間は朝9時~夜9時の間です。",
+            llm_text="受付時間は朝9時~夜9時の間です。",
+        )
+        tracker.add_word_and_check_complete("受付時間は朝9時")
+        self.assertEqual(tracker.get_llm_consumed(), "受付時間は朝9時~")
+        tracker.add_word_and_check_complete("~夜9時の")
+        self.assertEqual(tracker.get_llm_consumed(), "夜9時の")
+        tracker.add_word_and_check_complete("間です")
+        self.assertEqual(tracker.get_llm_consumed(), "間です。")
+
+    def test_leading_fullwidth_paren_keeps_span(self):
+        tracker = WordCompletionTracker(
+            "お名前（カタカナ）をお願いします。",
+            llm_text="お名前（カタカナ）をお願いします。",
+        )
+        tracker.add_word_and_check_complete("お名前")
+        self.assertEqual(tracker.get_llm_consumed(), "お名前（")
+        tracker.add_word_and_check_complete("（カタカナ）をお")
+        self.assertEqual(tracker.get_llm_consumed(), "カタカナ）をお")
+
+    def test_genuinely_desynced_span_is_still_discarded(self):
+        """Edge tolerance must not weaken real desync detection: alnum content
+        mismatch still discards the span."""
+        tracker = WordCompletionTracker(
+            "山田養蜂場でございます。",
+            llm_text="山田養蜂場でございます。",
+        )
+        # Manually desync the llm cursor by one char to emulate corruption.
+        tracker._llm_pos = 1
+        tracker.add_word_and_check_complete("山田養蜂場")
+        self.assertIsNone(tracker.get_llm_consumed())
+
+
 if __name__ == "__main__":
     unittest.main()

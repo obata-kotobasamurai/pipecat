@@ -86,6 +86,7 @@ class WordCompletionTracker:
         self._overflow_word: str | None = None
         self._llm_consumed: str | None = None
         self._frame_word: str | None = None
+        self._last_symbol_consumption_skipped = False
 
     @staticmethod
     def _normalize(text: str) -> str:
@@ -151,12 +152,24 @@ class WordCompletionTracker:
         return text.translate(WordCompletionTracker._TYPOGRAPHY_FOLD)
 
     @staticmethod
-    def _remove_trailing_punctuation(text: str) -> str:
-        """Remove punctuation only at the very end of the given text."""
-        i = len(text)
-        while i > 0 and unicodedata.category(text[i - 1]).startswith("P"):
-            i -= 1
-        return text[:i]
+    def _strip_edge_symbols(text: str) -> str:
+        """Strip XML/HTML tags, then non-alphanumeric characters from both ends.
+
+        Used to compare a TTS frame word against its llm_text span. TTS providers
+        may attach punctuation/symbols to either side of a word (e.g. ``"~夜9時の"``)
+        while the corresponding llm span starts after that symbol because the
+        previous word's trailing-punctuation sweep already consumed it. Only the
+        alphanumeric core is meaningful for the containment check — edge symbols
+        on either side must not cause the span to be discarded.
+        """
+        text = re.sub(r"<[^>]+>", "", text)
+        start = 0
+        end = len(text)
+        while start < end and not text[start].isalnum():
+            start += 1
+        while end > start and not text[end - 1].isalnum():
+            end -= 1
+        return text[start:end]
 
     @staticmethod
     def _advance_by_alnums(text: str, start_pos: int, n: int) -> int:
@@ -240,6 +253,7 @@ class WordCompletionTracker:
         self._overflow_word = None
         self._llm_consumed = None
         self._frame_word = None
+        self._last_symbol_consumption_skipped = False
 
         if prev_len > expected_len:
             logger.warning(f"{self}, trying to add a word in an already complete frame")
@@ -259,10 +273,10 @@ class WordCompletionTracker:
                 # llm_text, so the span must contain the frame word. If it
                 # doesn't, tts_text and llm_text are out of sync in an
                 # unexpected way — discard rather than returning a corrupt span.
-                # Also removing punctuation from the frame word to match the
-                # expected text, since some TTS services may add punctuation to
-                # the raw text.
-                word_without_punctuation = self._remove_trailing_punctuation(self._frame_word)
+                # Edge symbols are stripped from the frame word first, since TTS
+                # services may attach punctuation/symbols to either side of the
+                # raw word that the llm span legitimately lacks.
+                word_without_punctuation = self._strip_edge_symbols(self._frame_word)
                 if word_without_punctuation and word_without_punctuation not in self._llm_consumed:
                     logger.warning(
                         f"WordCompletionTracker: force-complete llm_consumed {repr(self._llm_consumed)!s} "
@@ -299,7 +313,8 @@ class WordCompletionTracker:
             if self.is_complete:
                 # Consume ALL remaining LLM text: closing tags (e.g. </card>)
                 # and any trailing punctuation that the TTS will not send separately.
-                self._llm_consumed = self._llm_text[self._llm_pos :]
+                # None (not "") when already exhausted, so callers see "no span".
+                self._llm_consumed = self._llm_text[self._llm_pos :] or None
                 self._llm_pos = len(self._llm_text)
             else:
                 if chars_for_frame == 0:
@@ -330,12 +345,18 @@ class WordCompletionTracker:
                         self._llm_consumed = candidate
                         self._llm_pos = end
                     else:
-                        logger.warning(
+                        # The symbol was already consumed elsewhere — most commonly
+                        # as the trailing-punctuation sweep of the previous word's
+                        # span (Cartesia ja delivers e.g. a mid-frame "、" as its
+                        # own timestamp event after the preceding chunk). Expected
+                        # for such providers, hence debug rather than warning.
+                        logger.debug(
                             f"WordCompletionTracker: symbol word {word!r} has no "
                             f"counterpart at llm_text cursor (found {candidate!r}), "
                             "skipping llm consumption"
                         )
                         self._llm_consumed = None
+                        self._last_symbol_consumption_skipped = True
                 else:
                     # Advance through llm_text by exactly chars_for_frame alphanumeric
                     # chars. Non-alnum chars (spaces, opening tags) are included in the
@@ -349,13 +370,18 @@ class WordCompletionTracker:
             # alnum count as the word stream, so the consumed span must contain
             # the frame word. If it doesn't, the cursors drifted out of sync
             # in an unexpected way — discard rather than returning a corrupt span.
-            # Also removing punctuation from the frame word to match the
-            # expected text, since some TTS services may add punctuation to
-            # the raw text.
-            word_without_punctuation = self._remove_trailing_punctuation(self._frame_word)
-            if word_without_punctuation and self._llm_consumed is not None and self._fold_typography(
+            # Edge symbols are stripped from the frame word first: TTS services
+            # may attach punctuation/symbols to either side of the raw word
+            # (e.g. "~夜9時の") that the llm span legitimately lacks because the
+            # previous word's trailing sweep already consumed them — discarding
+            # there would duplicate the symbol via the frame-text fallback.
+            word_without_punctuation = self._strip_edge_symbols(self._frame_word)
+            if (
                 word_without_punctuation
-            ) not in self._fold_typography(self._llm_consumed):
+                and self._llm_consumed is not None
+                and self._fold_typography(word_without_punctuation)
+                not in self._fold_typography(self._llm_consumed)
+            ):
                 logger.warning(
                     f"WordCompletionTracker: llm_consumed {repr(self._llm_consumed)!s} "
                     f"does not contain frame_word {repr(self._frame_word)!s}, discarding"
@@ -522,6 +548,18 @@ class WordCompletionTracker:
         """True when accumulated normalized chars >= expected normalized chars."""
         return len(self._received) >= len(self._tts_normalized)
 
+    @property
+    def last_symbol_consumption_skipped(self) -> bool:
+        """True when the last added word was a symbol-only token whose llm consumption was skipped.
+
+        Set when ``llm_text`` is present but the symbol had no counterpart at the
+        llm cursor — meaning it was already consumed elsewhere (typically as the
+        trailing-punctuation sweep of the previous word's span). Callers should
+        keep such tokens out of the conversation context to avoid duplicating
+        punctuation (e.g. ``"ご用件、" + "、"``).
+        """
+        return self._last_symbol_consumption_skipped
+
     def reset(self):
         """Reset received word accumulation without changing the expected text."""
         self._received = ""
@@ -530,3 +568,4 @@ class WordCompletionTracker:
         self._overflow_word = None
         self._llm_consumed = None
         self._frame_word = None
+        self._last_symbol_consumption_skipped = False

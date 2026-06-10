@@ -97,10 +97,16 @@ class LazySTTProxy(FrameProcessor):
         # STT. Without this the lazy STT crashes on first audio with
         # "FrameProcessorSetup.__init__() missing 1 required positional
         # argument: 'pipeline_worker'", taking down the whole failover chain.
+        clock = self._clock
+        task_manager = self._task_manager
+        pipeline_worker = self._pipeline_worker
+        assert clock is not None and task_manager is not None and pipeline_worker is not None, (
+            "LazySTTProxy must be set up before the wrapped STT is initialized"
+        )
         setup = FrameProcessorSetup(
-            clock=self._clock,
-            task_manager=self._task_manager,
-            pipeline_worker=self._pipeline_worker,
+            clock=clock,
+            task_manager=task_manager,
+            pipeline_worker=pipeline_worker,
             observer=self._observer,
         )
         await self._stt.setup(setup)
