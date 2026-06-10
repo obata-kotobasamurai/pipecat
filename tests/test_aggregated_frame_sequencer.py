@@ -900,5 +900,97 @@ class TestProcessWordMisroutedSentencePunctuation(unittest.TestCase):
         self.assertTrue(result[0].append_to_context)
 
 
+# ---------------------------------------------------------------------------
+# process_word — mid-frame standalone punctuation (Cartesia JA regression)
+# ---------------------------------------------------------------------------
+
+
+class TestProcessWordMidFrameStandalonePunctuation(unittest.TestCase):
+    """Regression: Cartesia (ja) can deliver mid-frame punctuation ("、", a
+    mid-frame "。") as its own word-timestamp event while the frame's slot is
+    still active. The llm cursor already consumed that punctuation as part of
+    the previous word's span (trailing-punctuation sweep), so appending the
+    standalone token to the context duplicates it ("ご用件、、")."""
+
+    @staticmethod
+    def _context_text(frames) -> str:
+        parts = []
+        for f in frames:
+            if isinstance(f, TTSTextFrame) and f.append_to_context:
+                parts.append(f.raw_text if f.raw_text else f.text)
+        return "".join(parts)
+
+    def test_midframe_standalone_comma_not_duplicated_in_context(self):
+        llm = "ご用件、お電話番号をお願いします。"
+        seq = _seq()
+        seq.register_spoken(_spoken_frame(llm), "ctx1", _tracker(llm, llm_text=llm), True)
+
+        frames = []
+        frames += seq.process_word("ご用件", pts=1, context_id="ctx1")
+        # The "、" was already swept into the previous span ("ご用件、").
+        frames += seq.process_word("、", pts=2, context_id="ctx1")
+        frames += seq.process_word("お電話番号をお願いします", pts=3, context_id="ctx1")
+        frames += seq.process_word("。", pts=4, context_id="ctx1")
+
+        self.assertEqual(self._context_text(frames), llm)
+
+    def test_multi_sentence_frame_standalone_punctuation_not_duplicated(self):
+        llm = "かしこまりました。失礼ですが、お名前を伺えますか。"
+        seq = _seq()
+        seq.register_spoken(_spoken_frame(llm), "ctx1", _tracker(llm, llm_text=llm), True)
+
+        frames = []
+        for i, w in enumerate(
+            ["かしこまりました", "。", "失礼ですが", "、", "お名前を伺えますか", "。"]
+        ):
+            frames += seq.process_word(w, pts=i, context_id="ctx1")
+
+        self.assertEqual(self._context_text(frames), llm)
+
+    def test_skipped_symbol_frame_still_emitted_for_word_timestamps(self):
+        """The deduped "、" must still be emitted (subtitle/timestamp consumers),
+        just with append_to_context=False."""
+        llm = "ご用件、お電話番号をお願いします。"
+        seq = _seq()
+        seq.register_spoken(_spoken_frame(llm), "ctx1", _tracker(llm, llm_text=llm), True)
+
+        seq.process_word("ご用件", pts=1, context_id="ctx1")
+        result = seq.process_word("、", pts=2, context_id="ctx1")
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].text, "、")
+        self.assertFalse(result[0].append_to_context)
+
+    def test_symbol_at_llm_cursor_is_still_consumed_and_appended(self):
+        """A symbol that genuinely lives at the llm cursor (frame-leading "、")
+        keeps the pre-fix behavior: consumed and appended with its raw span."""
+        llm = "、どうぞ"
+        seq = _seq()
+        seq.register_spoken(_spoken_frame(llm), "ctx1", _tracker(llm, llm_text=llm), True)
+
+        frames = []
+        first = seq.process_word("、", pts=1, context_id="ctx1")
+        frames += first
+        frames += seq.process_word("どうぞ", pts=2, context_id="ctx1")
+
+        self.assertTrue(first[0].append_to_context)
+        self.assertEqual(self._context_text(frames), llm)
+
+    def test_leading_symbol_attached_to_next_word_not_duplicated(self):
+        """Cartesia may attach a symbol to the FOLLOWING chunk ("~夜9時の") while
+        the llm span already consumed it via the previous word's sweep. The
+        contains-guard must tolerate edge symbols instead of discarding the span
+        (the frame-text fallback would duplicate the symbol: "朝9時~~夜9時")."""
+        llm = "受付時間は朝9時~夜9時の間です。"
+        seq = _seq()
+        seq.register_spoken(_spoken_frame(llm), "ctx1", _tracker(llm, llm_text=llm), True)
+
+        frames = []
+        for i, w in enumerate(["受付時間は朝9時", "~夜9時の", "間です", "。"]):
+            frames += seq.process_word(w, pts=i, context_id="ctx1")
+
+        self.assertEqual(self._context_text(frames), llm)
+
+
 if __name__ == "__main__":
     unittest.main()

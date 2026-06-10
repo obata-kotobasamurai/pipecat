@@ -150,6 +150,9 @@ class AggregatedFrameSequencer:
         - Overflow words straddling two slot boundaries.
         - Force-complete when the TTS drops an event (word belongs to the next slot).
         - Passthrough for words not recognised by any slot.
+        - Symbol-only words whose llm consumption was skipped (punctuation already
+          carried by an adjacent word's span) are emitted with
+          ``append_to_context=False`` to avoid duplicating punctuation in context.
         - Flushes any skipped slots unblocked by slot completion.
 
         Args:
@@ -241,6 +244,20 @@ class AggregatedFrameSequencer:
                 includes_inter_frame_spaces=slot_ifs,
             )
         ]
+
+        # A symbol-only token the slot claimed (it sits in the cursor window) but
+        # whose llm consumption was skipped is punctuation already carried by an
+        # adjacent word's span — e.g. Cartesia ja sends a mid-frame "、" as its
+        # own timestamp event after the preceding chunk's sweep consumed it.
+        # Appending it again would duplicate punctuation in the context
+        # ("ご用件、、"), so emit it for word-timestamp consumers only.
+        if (
+            is_symbol_only
+            and active
+            and active.tracker
+            and active.tracker.last_symbol_consumption_skipped
+        ):
+            frames[0].append_to_context = False
 
         if is_complete and active:
             active.complete = True
@@ -408,6 +425,12 @@ class AggregatedFrameSequencer:
                 includes_inter_frame_spaces=next_active.includes_inter_frame_spaces,
             )
         )
+        # Same dedup rule as process_word: a symbol-only overflow whose llm
+        # consumption was skipped is already carried by an adjacent span.
+        if next_active.tracker.last_symbol_consumption_skipped and not WordCompletionTracker._normalize(
+            raw_overflow_word
+        ):
+            frames[-1].append_to_context = False
         if overflow_complete:
             next_active.complete = True
             frames.extend(self.flush(last_word_pts=pts))
