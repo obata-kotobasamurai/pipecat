@@ -1141,5 +1141,53 @@ class TestVoiceFormattingTransforms(unittest.TestCase):
         self.assertIn("555-1234.", wf[0].text)
 
 
+# ---------------------------------------------------------------------------
+# force_complete with context_id scoping
+# ---------------------------------------------------------------------------
+
+
+class TestForceCompleteContextScoped(unittest.TestCase):
+    def test_scoped_force_complete_only_touches_matching_context(self):
+        """Slots of a later context must keep waiting for their own word timestamps.
+
+        Reproduces the pre-tool filler race: while the filler context (ctx1) is
+        draining, the LLM response's sentences are already registered under ctx2.
+        Force-completing at ctx1's end must not emit ctx2's text early — its real
+        word-timestamp events would duplicate it afterwards.
+        """
+        seq = _seq()
+        seq.register_spoken(_spoken_frame("filler"), "ctx1", _tracker("filler"), True)
+        seq.register_spoken(_spoken_frame("llm reply"), "ctx2", _tracker("llm reply"), True)
+
+        result = seq.force_complete(last_word_pts=10, context_id="ctx1")
+        tts_frames = [f for f in result if isinstance(f, TTSTextFrame)]
+        self.assertEqual(len(tts_frames), 1)
+        self.assertEqual(tts_frames[0].text, "filler")
+
+        # ctx2 still completes via its real word timestamps, no duplication.
+        frames = seq.process_word("llm", pts=20, context_id="ctx2")
+        frames += seq.process_word("reply", pts=30, context_id="ctx2")
+        words = [f.text for f in frames if isinstance(f, TTSTextFrame)]
+        self.assertEqual(words, ["llm", "reply"])
+
+    def test_scoped_force_complete_flushes_skipped_behind_matching_slot(self):
+        seq = _seq()
+        seq.register_spoken(_spoken_frame("hello"), "ctx1", _tracker("hello"), True)
+        skipped = _skipped_frame("code")
+        seq.register_skipped(skipped, "ctx-skip", None)
+
+        result = seq.force_complete(last_word_pts=5, context_id="ctx1")
+        self.assertTrue(any(f is skipped for f in result))
+
+    def test_unscoped_force_complete_keeps_legacy_behavior(self):
+        seq = _seq()
+        seq.register_spoken(_spoken_frame("one"), "ctx1", _tracker("one"), True)
+        seq.register_spoken(_spoken_frame("two"), "ctx2", _tracker("two"), True)
+
+        result = seq.force_complete(last_word_pts=5)
+        texts = [f.text for f in result if isinstance(f, TTSTextFrame)]
+        self.assertEqual(texts, ["one", "two"])
+
+
 if __name__ == "__main__":
     unittest.main()

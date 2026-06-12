@@ -1154,6 +1154,41 @@ class TestLLMAssistantAggregator(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(stop_messages[1].interrupted)
         self.assertEqual(stop_messages[1].content, "Hello there!")
 
+    async def test_interruption_commits_orphaned_aggregation(self):
+        """Words that arrive after the turn closed must still be committed on interruption.
+
+        Reproduces the pre-tool filler race: a deferred LLMFullResponseEndFrame
+        (emitted at the end of an interleaved TTSSpeakFrame audio context) closes
+        the assistant turn before the LLM's own playback-paced TTSTextFrames reach
+        the aggregator. Those words then accumulate with no open turn; the next
+        InterruptionFrame must commit them instead of silently dropping them.
+        """
+        context = LLMContext()
+
+        aggregator = LLMAssistantAggregator(context)
+
+        frames_to_send = [
+            LLMFullResponseStartFrame(),
+            LLMFullResponseEndFrame(),  # closes the turn before any words arrived
+            LLMTextFrame("Hello "),  # playback-paced words land after the close
+            LLMTextFrame("there!"),
+            SleepFrame(),
+            InterruptionFrame(),
+        ]
+        expected_down_frames = [
+            LLMContextFrame,
+            LLMContextAssistantTimestampFrame,
+            InterruptionFrame,
+        ]
+        await run_test(
+            aggregator,
+            frames_to_send=frames_to_send,
+            expected_down_frames=expected_down_frames,
+        )
+        messages = context.get_messages()
+        self.assertEqual(messages[-1]["role"], "assistant")
+        self.assertEqual(messages[-1]["content"], "Hello there!")
+
     async def test_function_call(self):
         context = LLMContext()
         aggregator = LLMAssistantAggregator(context)

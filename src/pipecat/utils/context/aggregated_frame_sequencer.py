@@ -292,8 +292,8 @@ class AggregatedFrameSequencer:
                 break  # spoken but not yet complete — wait
         return frames
 
-    def force_complete(self, last_word_pts: int) -> list[Frame]:
-        """Force-complete all incomplete spoken slots and flush skipped frames.
+    def force_complete(self, last_word_pts: int, context_id: str | None = None) -> list[Frame]:
+        """Force-complete incomplete spoken slots and flush skipped frames.
 
         Called at the end of an audio context to handle TTS providers that silently drop
         word-timestamp events. Emits a TTSTextFrame for any remaining unspoken text in
@@ -303,6 +303,12 @@ class AggregatedFrameSequencer:
         Args:
             last_word_pts: PTS of the last received word frame, used as the PTS for
                 force-completed frames and forwarded to :meth:`flush`.
+            context_id: When provided, only slots registered under this context ID are
+                force-completed; slots of other (typically later) contexts keep waiting
+                for their own word timestamps. Force-completing them here would emit
+                their full text early, and the real word-timestamp events arriving
+                later would duplicate it. When None, all incomplete spoken slots are
+                force-completed (legacy behavior).
 
         Returns:
             Combined list of TTSTextFrames (for incomplete spoken slots) and
@@ -310,6 +316,8 @@ class AggregatedFrameSequencer:
         """
         frames: list[Frame] = []
         for slot in self._slots:
+            if context_id is not None and slot.context_id != context_id:
+                continue
             if slot.spoken and not slot.complete:
                 if slot.tracker:
                     remaining_text = slot.tracker.get_remaining_tts_text()

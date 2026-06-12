@@ -310,6 +310,13 @@ class TTSService(AIService):
 
         self._processing_text: bool = False
         self._tts_contexts: dict[str, TTSContext] = {}
+        # Audio contexts created by TTSSpeakFrame (e.g. pre-tool filler messages).
+        # Their drain must NOT emit the deferred LLMFullResponseEndFrame nor clear
+        # _llm_response_started: a speak utterance can complete while an LLM
+        # response is still pending, and consuming the flag there would leave the
+        # LLM turn without an End frame (its spoken words would never be committed
+        # to the assistant context).
+        self._speak_frame_context_ids: set[str] = set()
         self._streamed_text: str = ""
         self._sent_non_whitespace_in_context: bool = False
         self._text_aggregation_metrics_started: bool = False
@@ -789,6 +796,7 @@ class TTSService(AIService):
                 ),
                 append_tts_text_to_context=frame.append_to_context,
                 push_assistant_aggregation=push_assistant_aggregation,
+                from_speak_frame=True,
             )
             await self.on_turn_context_completed()
             # We pause processing incoming frames because we are sending data to
@@ -942,6 +950,7 @@ class TTSService(AIService):
         self._text_aggregation_metrics_started = False
         self._aggregated_frame_sequencer.clear()  # discard all pending slots on interruption
         self._pending_llm_response_end_frames.clear()
+        self._speak_frame_context_ids.clear()
         await self.reset_word_timestamps()
 
         await self._stop_audio_context_task()
@@ -1013,6 +1022,7 @@ class TTSService(AIService):
         includes_inter_frame_spaces: bool | None = False,
         append_tts_text_to_context: bool = True,
         push_assistant_aggregation: bool | None = False,
+        from_speak_frame: bool = False,
     ):
         type = src_frame.aggregated_by
         text = src_frame.text
@@ -1114,6 +1124,8 @@ class TTSService(AIService):
             append_to_context=append_tts_text_to_context,
             push_assistant_aggregation=push_assistant_aggregation,
         )
+        if from_speak_frame:
+            self._speak_frame_context_ids.add(context_id)
 
         # Apply any final text preparation (e.g., trailing space)
         prepared_text = self._prepare_text_for_tts(transformed_text)
@@ -1557,11 +1569,22 @@ class TTSService(AIService):
         are not being pushed (which would have already emitted the frame), the end
         frame held for ``context_id`` is re-pushed with the PTS of the last word frame.
 
+        When the ended context belongs to a TTSSpeakFrame utterance (e.g. a pre-tool
+        filler spoken while a tool runs), the deferred LLMFullResponseEndFrame is NOT
+        emitted and ``_llm_response_started`` is left untouched: the pending LLM
+        response's own audio context has not played yet, and consuming the flag here
+        would close the assistant turn early — the LLM's spoken words would then
+        accumulate without an End frame and be silently dropped on the next
+        interruption. (kotoba custom, 575f7cdf.)
+
         Args:
             context_id: The audio context that just ended, used to look up the held
                 LLMFullResponseEndFrame.
         """
         await self.reset_word_timestamps()
+        if context_id is not None and context_id in self._speak_frame_context_ids:
+            self._speak_frame_context_ids.discard(context_id)
+            return
         # If self._push_text_frames is True, we have already pushed the original LLMFullResponseEndFrame
         if self._llm_response_started and not self._push_text_frames:
             self._llm_response_started = False
@@ -1574,14 +1597,24 @@ class TTSService(AIService):
             frame.pts = self._word_last_pts
             await self.push_frame(frame)
 
-    async def _apply_force_complete(self):
-        """Force-complete all incomplete spoken slots and push any unblocked skipped frames.
+    async def _apply_force_complete(self, context_id: str | None = None):
+        """Force-complete incomplete spoken slots and push any unblocked skipped frames.
 
         Called at end-of-context to handle TTS providers that silently drop word-timestamp
         events. Emits a TTSTextFrame for any remaining unspoken text, then flushes skipped
         frames that were blocked by those incomplete slots.
+
+        Args:
+            context_id: When provided, only slots belonging to this audio context are
+                force-completed. Slots of later contexts (e.g. an LLM response whose
+                sentences were registered while a pre-tool TTSSpeakFrame utterance was
+                still draining) keep waiting for their own word timestamps — force
+                completing them here would emit their full text early and the real
+                word-timestamp events would then duplicate it.
         """
-        for f in self._aggregated_frame_sequencer.force_complete(self._word_last_pts):
+        for f in self._aggregated_frame_sequencer.force_complete(
+            self._word_last_pts, context_id=context_id
+        ):
             if isinstance(f, TTSTextFrame):
                 self._word_last_pts = f.pts
             await self.push_frame(f)
@@ -1629,7 +1662,7 @@ class TTSService(AIService):
                             frame.append_to_context = tts_context.append_to_context
                     elif isinstance(frame, TTSStoppedFrame):
                         # Checking if we have any remaining spoken slots before pushing the TTSStoppedFrame
-                        await self._apply_force_complete()
+                        await self._apply_force_complete(context_id)
 
                         should_push_stop_frame = False
                         # Setting the last word timestamp as the TTSStoppedFrame PTS
@@ -1648,7 +1681,7 @@ class TTSService(AIService):
                     should_push_stop_frame = False
                 break
 
-        await self._apply_force_complete()
+        await self._apply_force_complete(context_id)
 
         if should_push_stop_frame and self._push_stop_frames:
             await self.push_frame(TTSStoppedFrame(context_id=context_id))
