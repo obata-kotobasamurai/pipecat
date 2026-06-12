@@ -1595,6 +1595,14 @@ class LLMAssistantAggregator(LLMContextAggregator):
             await self.push_context_frame(FrameDirection.UPSTREAM)
 
     async def _handle_interruptions(self, frame: InterruptionFrame):
+        # Safety net: TTSTextFrames may have accumulated after the assistant turn
+        # was already closed — e.g. a deferred LLMFullResponseEndFrame emitted at
+        # the end of an interleaved TTSSpeakFrame utterance (pre-tool filler)
+        # consumed the turn before the LLM's own words finished playing. Commit
+        # them instead of silently dropping spoken text from the context.
+        if not self._assistant_turn_start_timestamp and self._aggregation:
+            logger.debug(f"{self}: committing orphaned assistant aggregation on interruption")
+            await self.push_aggregation()
         await self._trigger_assistant_turn_stopped(interrupted=True)
         await self.reset()
 
