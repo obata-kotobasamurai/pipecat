@@ -20,6 +20,8 @@ from dataclasses import fields as dataclass_fields
 from typing import Any, Literal
 
 from loguru import logger
+from typing_extensions import override
+from websockets.asyncio.client import connect as websocket_connect
 
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.adapters.services.inworld_realtime_adapter import InworldRealtimeLLMAdapter
@@ -62,13 +64,6 @@ from pipecat.services.settings import (
 from pipecat.utils.time import time_now_iso8601
 
 from . import events
-
-try:
-    from websockets.asyncio.client import connect as websocket_connect
-except ModuleNotFoundError as e:
-    logger.error(f"Exception: {e}")
-    logger.error("In order to use Inworld Realtime, you need to `pip install pipecat-ai[inworld]`.")
-    raise ImportError(f"Missing module: {e}") from e
 
 
 @dataclass
@@ -540,6 +535,11 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
     # Frame processing
     #
 
+    @override
+    def _service_tools(self) -> "ToolsSchema | list[Any] | None":
+        """Return the tools configured on ``session_properties``, if any."""
+        return assert_given(self._settings.session_properties).tools
+
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Process incoming frames from the pipeline."""
         await super().process_frame(frame, direction)
@@ -562,6 +562,10 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
         elif isinstance(frame, LLMMessagesAppendFrame):
             await self._handle_messages_append(frame)
         elif isinstance(frame, LLMSetToolsFrame):
+            # Continuous session: no fresh context frame per turn, so sync the
+            # registered tool handlers to the new tool set here (the base service
+            # only does this on LLMContextFrame).
+            self._sync_registered_tool_handlers(frame.tools)
             await self._send_session_update()
 
         await self.push_frame(frame, direction)
@@ -705,7 +709,9 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
 
     async def _send_session_update(self):
         """Update session settings on the server."""
-        settings = assert_given(self._settings.session_properties)
+        # Mutate a copy: the stored session_properties is read elsewhere (e.g.
+        # _service_tools) and must stay intact.
+        settings = assert_given(self._settings.session_properties).model_copy()
         adapter = self.get_llm_adapter()
 
         if self._context:
@@ -714,6 +720,7 @@ class InworldRealtimeLLMService(LLMService[InworldRealtimeLLMAdapter]):
                 system_instruction=assert_given(self._settings.system_instruction),
             )
 
+            # tools given in the context override the tools in the session properties
             if llm_invocation_params["tools"]:
                 settings.tools = llm_invocation_params["tools"]
 

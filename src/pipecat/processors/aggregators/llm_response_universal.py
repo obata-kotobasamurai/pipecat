@@ -41,6 +41,7 @@ from pipecat.frames.frames import (
     InterruptionFrame,
     LLMAssistantPushAggregationFrame,
     LLMContextAssistantTimestampFrame,
+    LLMContextAssistantTurnFrame,
     LLMContextFrame,
     LLMContextSummaryRequestFrame,
     LLMFullResponseEndFrame,
@@ -61,6 +62,9 @@ from pipecat.frames.frames import (
     TextFrame,
     TranscriptionFrame,
     TranslationFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
+    TTSTextFrame,
     UserImageRawFrame,
     UserMuteStartedFrame,
     UserMuteStoppedFrame,
@@ -147,7 +151,7 @@ class LLMUserAggregatorParams:
 
             .. deprecated:: 1.2.0
                 Use ``user_turn_strategies=FilterIncompleteUserTurnStrategies()``
-                instead. Will be removed in version 2.0.0.
+                instead. Will be removed in 2.0.0.
 
         user_turn_completion_config: Configuration for turn
             completion behavior including custom instructions, timeouts, and
@@ -158,7 +162,7 @@ class LLMUserAggregatorParams:
             .. deprecated:: 1.2.0
                 Pass the config directly to
                 ``FilterIncompleteUserTurnStrategies(config=...)`` instead.
-                Will be removed in version 2.0.0.
+                Will be removed in 2.0.0.
     """
 
     add_tool_change_messages: bool = False
@@ -222,21 +226,25 @@ class LLMAssistantAggregatorParams:
             (LLM-specific) tools are ignored. When using
             ``LLMContextAggregatorPair``, prefer setting this via its
             ``add_tool_change_messages`` argument instead. Defaults to False.
+        enable_context_summarization: Legacy field name.
+
+            .. deprecated:: 1.2.0
+                Use :attr:`enable_auto_context_summarization` instead. Will be
+                removed in 2.0.0.
+
+        context_summarization_config: Legacy field name.
+
+            .. deprecated:: 1.2.0
+                Use :attr:`auto_context_summarization_config` instead. Will be
+                removed in 2.0.0.
     """
 
     enable_auto_context_summarization: bool = False
     auto_context_summarization_config: LLMAutoContextSummarizationConfig | None = None
     add_tool_change_messages: bool = False
 
-    # ---------------------------------------------------------------------------
-    # Deprecated field names — kept for backward compatibility.
-    # Use enable_auto_context_summarization and auto_context_summarization_config instead.
-    #
-    # .. deprecated:: 1.2.0
-    #     Use ``enable_auto_context_summarization`` and
-    #     ``auto_context_summarization_config`` instead. Will be removed in
-    #     version 2.0.0.
-    # ---------------------------------------------------------------------------
+    # Deprecated field names — kept for backward compatibility. See the
+    # ``.. deprecated::`` directives in the class docstring above.
     enable_context_summarization: bool | None = None
     context_summarization_config: LLMContextSummarizationConfig | None = None
 
@@ -799,8 +807,12 @@ class LLMUserAggregator(LLMContextAggregator):
         elif isinstance(frame, LLMMessagesTransformFrame):
             await self._handle_llm_messages_transform(frame)
         elif isinstance(frame, LLMSetToolsFrame):
-            self._maybe_add_tool_change_messages(frame.tools)
-            self.set_tools(frame.tools)
+            # Normalize and validate (a plain list of direct functions / FunctionSchema
+            # objects becomes a ToolsSchema) so the tool-change diff and
+            # set_tools see a consistent type.
+            normalized_tools = LLMContext._normalize_and_validate_tools(frame.tools)
+            self._maybe_add_tool_change_messages(normalized_tools)
+            self.set_tools(normalized_tools)
             # Push the LLMSetToolsFrame as well, since speech-to-speech LLM
             # services (like OpenAI Realtime) may need to know about tool
             # changes; unlike text-based LLM services they won't just "pick up
@@ -996,11 +1008,6 @@ class LLMUserAggregator(LLMContextAggregator):
             self._realtime_deferred_handoff_flush(),
             name=f"{self}::realtime_handoff_flush",
         )
-        # Yield so the task's wrapper coroutine starts running before
-        # any immediate cancellation by the failsafe path — otherwise
-        # asyncio GCs the inner coroutine without ever entering it and
-        # emits a "coroutine was never awaited" warning.
-        await asyncio.sleep(0)
 
     async def _realtime_deferred_handoff_flush(self) -> None:
         """Wait one ``ttfs_p99_latency`` window, then flush whatever has arrived."""
@@ -1385,6 +1392,7 @@ class LLMAssistantAggregator(LLMContextAggregator):
         self._push_context_on_bot_stopped_speaking: bool = False
 
         self._assistant_turn_start_timestamp = ""
+        self._current_tts_append_to_context: bool | None = None
 
         self._thought_append_to_context = False
         self._thought_llm: str = ""
@@ -1453,6 +1461,12 @@ class LLMAssistantAggregator(LLMContextAggregator):
             await self.push_frame(frame, direction)
         elif isinstance(frame, LLMAssistantPushAggregationFrame):
             await self._handle_push_aggregation()
+        elif isinstance(frame, TTSStartedFrame):
+            await self._handle_tts_started(frame)
+            await self.push_frame(frame, direction)
+        elif isinstance(frame, TTSStoppedFrame):
+            self._current_tts_append_to_context = None
+            await self.push_frame(frame, direction)
         elif isinstance(frame, LLMFullResponseStartFrame):
             await self._handle_llm_start(frame)
         elif isinstance(frame, LLMFullResponseEndFrame):
@@ -1476,8 +1490,12 @@ class LLMAssistantAggregator(LLMContextAggregator):
         elif isinstance(frame, LLMMessagesTransformFrame):
             await self._handle_llm_messages_transform(frame)
         elif isinstance(frame, LLMSetToolsFrame):
-            self._maybe_add_tool_change_messages(frame.tools)
-            self.set_tools(frame.tools)
+            # Normalize and validate (a plain list of direct functions / FunctionSchema
+            # objects becomes a ToolsSchema) so the tool-change diff and
+            # set_tools see a consistent type.
+            normalized_tools = LLMContext._normalize_and_validate_tools(frame.tools)
+            self._maybe_add_tool_change_messages(normalized_tools)
+            self.set_tools(normalized_tools)
         elif isinstance(frame, LLMSetToolChoiceFrame):
             self.set_tool_choice(frame.tool_choice)
         elif isinstance(frame, FunctionCallsStartedFrame):
@@ -1604,10 +1622,12 @@ class LLMAssistantAggregator(LLMContextAggregator):
             logger.debug(f"{self}: committing orphaned assistant aggregation on interruption")
             await self.push_aggregation()
         await self._trigger_assistant_turn_stopped(interrupted=True)
+        self._current_tts_append_to_context = None
         await self.reset()
 
     async def _handle_end_or_cancel(self, frame: Frame):
         await self._trigger_assistant_turn_stopped(interrupted=isinstance(frame, CancelFrame))
+        self._current_tts_append_to_context = None
         if self._summarizer:
             await self._summarizer.cleanup()
 
@@ -1871,21 +1891,31 @@ class LLMAssistantAggregator(LLMContextAggregator):
             await self._paired_user_aggregator._realtime_handoff_flush_immediate()
         await self._trigger_assistant_turn_stopped()
 
-    async def _handle_push_aggregation(self):
-        # LLMAssistantPushAggregationFrame is emitted by TTSService at the end
-        # of a TTSSpeakFrame-driven utterance (no surrounding LLM response
-        # cycle), so no LLMFullResponseStartFrame ever set the turn-start
-        # timestamp. Open a turn now so on_assistant_turn_stopped fires for the
-        # greeting text the same way it did before LLMAssistantPushAggregationFrame
-        # was introduced.
-        if not self._assistant_turn_start_timestamp:
+    async def _handle_tts_started(self, frame: TTSStartedFrame):
+        # If this TTS output will be written to context and we don't already have an
+        # open assistant turn, open one. This handles the case of TTSSpeakFrame-driven
+        # utterances that have no surrounding LLM response frames to signal assistant
+        # turn boundaries, while rightly deferring to any earlier LLM-driven turn start.
+        self._current_tts_append_to_context = frame.append_to_context
+        if frame.append_to_context and not self._assistant_turn_start_timestamp:
             await self._trigger_assistant_turn_started()
+
+    async def _handle_push_aggregation(self):
+        # LLMAssistantPushAggregationFrame is emitted at the end of
+        # a TTSSpeakFrame-driven utterance to commit the spoken text.
         await self._trigger_assistant_turn_stopped()
 
     async def _handle_text(self, frame: TextFrame):
         # Skip TextFrame types not intended to build the assistant context
         if isinstance(frame, (TranscriptionFrame, TranslationFrame, InterimTranscriptionFrame)):
             return
+
+        if (
+            isinstance(frame, TTSTextFrame)
+            and self._current_tts_append_to_context is False
+            and frame.append_to_context
+        ):
+            frame.append_to_context = False
 
         if not frame.append_to_context:
             return
@@ -2017,6 +2047,12 @@ class LLMAssistantAggregator(LLMContextAggregator):
             timestamp=self._assistant_turn_start_timestamp,
         )
         await self._call_event_handler("on_assistant_turn_stopped", message)
+        if aggregation:
+            await self.broadcast_frame(
+                LLMContextAssistantTurnFrame,
+                text=aggregation,
+                timestamp=self._assistant_turn_start_timestamp,
+            )
 
         self._assistant_turn_start_timestamp = ""
 
