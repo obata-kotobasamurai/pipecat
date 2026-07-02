@@ -6,6 +6,7 @@
 
 """Cartesia text-to-speech service implementations."""
 
+import asyncio
 import base64
 import json
 import re
@@ -584,6 +585,33 @@ class CartesiaTTSService(WebsocketTTSService):
         if self._websocket:
             return self._websocket
         raise Exception("Websocket not connected")
+
+    async def on_audio_context_stalled(self, context_id: str):
+        """Drop the (likely dead) websocket so the next synthesis reconnects.
+
+        A mid-stream stall almost always means the server went silent without a
+        close frame; the connection can keep looking OPEN for up to
+        ping_interval + ping_timeout (~40s with websockets defaults), so any
+        retry sent through it would vanish into the void. Cancel the receive
+        loop and abandon the socket — the retry's ``run_tts()`` then finds no
+        websocket and reconnects immediately.
+        """
+        logger.warning(
+            f"{self} audio context {context_id} stalled; dropping websocket to force reconnect"
+        )
+        if self._receive_task:
+            await self.cancel_task(self._receive_task)
+            self._receive_task = None
+        websocket = self._websocket
+        self._websocket = None
+        if websocket:
+            try:
+                # close() waits for a close-frame handshake the dead peer will
+                # never answer; cap it so the stall error (and with it the
+                # retry) isn't delayed by close_timeout.
+                await asyncio.wait_for(websocket.close(), timeout=2.0)
+            except Exception:
+                pass
 
     async def on_audio_context_interrupted(self, context_id: str):
         """Cancel the active Cartesia context when the bot is interrupted."""

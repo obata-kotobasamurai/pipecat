@@ -156,6 +156,13 @@ class TTSService(AIService):
         push_start_frame: bool = False,
         # if push_stop_frames is True, wait for this idle period before pushing TTSStoppedFrame
         stop_frame_timeout_s: float = 3.0,
+        # if True, an audio-context idle timeout with unspoken word-timestamp text
+        # remaining pushes a TTSErrorFrame (carrying that text) instead of failing
+        # silently, so retry/failover logic can re-speak it. Only enable for
+        # word-timestamp services whose contexts normally end with an explicit
+        # "done" signal (e.g. Cartesia) — for services that rely on this timeout
+        # as their regular completion path it would produce false errors.
+        error_on_stalled_context: bool = False,
         # if True, TTSService will push silence audio frames after TTSStoppedFrame
         push_silence_after_stop: bool = False,
         # if push_silence_after_stop is True, send this amount of audio silence
@@ -205,6 +212,9 @@ class TTSService(AIService):
                 When True, the base class handles ``create_audio_context`` and yields ``TTSStartedFrame``
                 before each synthesis call, so ``run_tts`` implementations do not need to.
             stop_frame_timeout_s: Idle time before pushing TTSStoppedFrame when push_stop_frames is True.
+            error_on_stalled_context: Whether an audio-context idle timeout with unspoken
+                word-timestamp text remaining should push a TTSErrorFrame carrying that text
+                (mid-stream stall detection). See the parameter comment for caveats.
             push_silence_after_stop: Whether to push silence audio after TTSStoppedFrame.
             silence_time_s: Duration of silence to push when push_silence_after_stop is True.
             pause_frame_processing: Whether to pause frame processing during audio generation.
@@ -280,6 +290,7 @@ class TTSService(AIService):
         self._push_stop_frames: bool = push_stop_frames
         self._push_start_frame: bool = push_start_frame
         self._stop_frame_timeout_s: float = stop_frame_timeout_s
+        self._error_on_stalled_context: bool = error_on_stalled_context
         self._push_silence_after_stop: bool = push_silence_after_stop
         self._silence_time_s: float = silence_time_s
         self._pause_frame_processing: bool = pause_frame_processing
@@ -1679,6 +1690,7 @@ class TTSService(AIService):
                 if should_push_stop_frame and self._push_stop_frames:
                     await self.push_frame(TTSStoppedFrame(context_id=context_id))
                     should_push_stop_frame = False
+                await self._maybe_push_stalled_context_error(context_id)
                 break
 
         await self._apply_force_complete(context_id)
@@ -1687,6 +1699,64 @@ class TTSService(AIService):
             await self.push_frame(TTSStoppedFrame(context_id=context_id))
 
         await self._maybe_reset_word_timestamps(context_id)
+
+    async def _maybe_push_stalled_context_error(self, context_id: str):
+        """Surface a mid-stream synthesis stall as a TTSErrorFrame.
+
+        Called from the audio-context idle-timeout path. When
+        ``error_on_stalled_context`` is enabled and word-timestamp slots for this
+        context still hold unspoken text, the provider stopped delivering audio
+        mid-utterance (e.g. its websocket died without a close frame). Instead of
+        letting force-complete silently drop the tail, push a ``TTSErrorFrame``
+        carrying the remaining text so retry/failover logic (e.g. a
+        ServiceSwitcher strategy) can re-speak it. ``on_audio_context_stalled()``
+        runs first so the provider can reset its connection before any retry
+        reaches ``run_tts()``.
+
+        Interruptions never reach this path: they cancel the audio-context task
+        and clear the sequencer slots, so no stall error fires for them.
+
+        Args:
+            context_id: The audio context that timed out while playing.
+        """
+        if not self._error_on_stalled_context:
+            return
+        remaining_text = self._aggregated_frame_sequencer.peek_remaining_text(context_id)
+        if not remaining_text:
+            return
+        logger.warning(
+            f"{self} audio context {context_id} stalled: no audio for "
+            f"{self._stop_frame_timeout_s:.1f}s with unspoken text {remaining_text!r}"
+        )
+        try:
+            await self.on_audio_context_stalled(context_id)
+        except Exception as e:
+            logger.warning(f"{self} on_audio_context_stalled failed: {e}")
+        await self.push_error_frame(
+            TTSErrorFrame(
+                error=(
+                    f"TTS audio context stalled: no audio received for "
+                    f"{self._stop_frame_timeout_s:.1f}s with unspoken text remaining"
+                ),
+                text=remaining_text,
+                tts_context_id=context_id,
+                retry_group_id=self._retry_group_for_context(context_id),
+            )
+        )
+
+    async def on_audio_context_stalled(self, context_id: str):
+        """Called when a playing audio context stalls mid-stream.
+
+        Only invoked when ``error_on_stalled_context`` is enabled and the
+        idle-timeout fired with unspoken word-timestamp text remaining, right
+        before the corresponding ``TTSErrorFrame`` is pushed. Override this in a
+        subclass to reset provider state (e.g. drop a dead websocket) so that a
+        subsequent retry synthesizes on a fresh connection.
+
+        Args:
+            context_id: The ID of the audio context that stalled.
+        """
+        pass
 
     async def on_audio_context_interrupted(self, context_id: str):
         """Called when an audio context is cancelled due to an interruption.

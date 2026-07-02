@@ -292,6 +292,31 @@ class AggregatedFrameSequencer:
                 break  # spoken but not yet complete — wait
         return frames
 
+    def peek_remaining_text(self, context_id: str | None = None) -> str:
+        """Return the unspoken TTS text of incomplete spoken slots, without mutating state.
+
+        Mirrors the slot selection of :meth:`force_complete` (spoken, not complete,
+        matching ``context_id``) but only reads the trackers. Used to detect a
+        mid-stream synthesis stall: if an audio context times out while this is
+        non-empty, audio for the remaining text never arrived.
+
+        Args:
+            context_id: When provided, only slots registered under this context ID
+                are inspected. When None, all incomplete spoken slots are.
+
+        Returns:
+            Concatenated remaining TTS text across matching slots ("" if none).
+        """
+        parts: list[str] = []
+        for slot in self._slots:
+            if context_id is not None and slot.context_id != context_id:
+                continue
+            if slot.spoken and not slot.complete and slot.tracker:
+                remaining = slot.tracker.get_remaining_tts_text()
+                if remaining:
+                    parts.append(remaining)
+        return "".join(parts)
+
     def force_complete(self, last_word_pts: int, context_id: str | None = None) -> list[Frame]:
         """Force-complete incomplete spoken slots and flush skipped frames.
 
