@@ -460,6 +460,17 @@ class WordCompletionTracker:
         """
         return self._segment_map.in_transformed_segment or self._last_symbol_consumption_skipped
 
+    @property
+    def last_symbol_consumption_skipped(self) -> bool:
+        """True when the last added word was a symbol-only token whose llm consumption
+        was skipped (punctuation already carried by an adjacent word's span).
+
+        Public accessor for the flag also consumed by :meth:`suppress_in_context`; kept
+        as a documented API for callers/tests that inspect the skip decision directly.
+        (kotoba custom, bed06035.)
+        """
+        return self._last_symbol_consumption_skipped
+
     def get_word_for_frame(self) -> str | None:
         """Return the portion of the last word that belongs to this frame.
 
