@@ -462,8 +462,7 @@ class WordCompletionTracker:
 
     @property
     def last_symbol_consumption_skipped(self) -> bool:
-        """True when the last added word was a symbol-only token whose llm consumption
-        was skipped (punctuation already carried by an adjacent word's span).
+        """Return whether the last symbol-only word skipped LLM consumption.
 
         Public accessor for the flag also consumed by :meth:`suppress_in_context`; kept
         as a documented API for callers/tests that inspect the skip decision directly.

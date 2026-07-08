@@ -29,7 +29,12 @@ from pipecat.frames.frames import (
     TTSStoppedFrame,
 )
 from pipecat.services.settings import NOT_GIVEN, TTSSettings, _NotGiven, assert_given
-from pipecat.services.tts_service import TextAggregationMode, TTSService, WebsocketTTSService
+from pipecat.services.tts_service import (
+    TextAggregationMode,
+    TTSAudioContextStats,
+    TTSService,
+    WebsocketTTSService,
+)
 from pipecat.transcriptions.language import Language, resolve_language
 from pipecat.utils.text.skip_tags_aggregator import SkipTagsAggregator
 from pipecat.utils.tracing.service_decorators import traced_tts
@@ -630,6 +635,22 @@ class CartesiaTTSService(WebsocketTTSService):
         """
         await super().on_audio_context_completed(context_id)
 
+    async def on_audio_context_finished(
+        self, context_id: str, end_reason: str, stats: TTSAudioContextStats
+    ):
+        """Log one-line receive statistics for each Cartesia context."""
+        logger.info(
+            "[cartesia_tts] context_end "
+            f"context_id={context_id} "
+            f"chunks={stats.audio_chunk_count} "
+            f"received_bytes={stats.audio_bytes} "
+            f"received_audio_seconds={stats.audio_seconds:.3f} "
+            f"timestamp_words={stats.timestamp_word_count} "
+            f"expected_audio_seconds={stats.expected_audio_seconds:.3f} "
+            f"end_reason={end_reason}"
+        )
+        await super().on_audio_context_finished(context_id, end_reason, stats)
+
     async def flush_audio(self, context_id: str | None = None):
         """Flush any pending audio and finalize the current context.
 
@@ -703,6 +724,7 @@ class CartesiaTTSService(WebsocketTTSService):
                 )
                 await self.append_to_audio_context(ctx_id, frame)
             elif msg["type"] == "error":
+                await self._notify_audio_context_finished(ctx_id, "error")
                 await self.push_frame(TTSStoppedFrame(context_id=ctx_id))
                 await self.stop_all_metrics()
                 await self.push_error(error_msg=f"Error: {msg}")
