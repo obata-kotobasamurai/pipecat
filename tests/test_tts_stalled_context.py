@@ -29,12 +29,18 @@ from pipecat.frames.frames import (
     TTSAudioRawFrame,
     TTSErrorFrame,
     TTSSpeakFrame,
+    TTSStoppedFrame,
 )
 from pipecat.services.tts_service import TTSService
 from pipecat.tests.utils import SleepFrame, run_test
 
 _FAKE_AUDIO = b"\x00\x01" * 320
 _SAMPLE_RATE = 16000
+
+
+def _fake_audio_for_seconds(seconds: float) -> bytes:
+    sample_count = int(_SAMPLE_RATE * seconds)
+    return b"\x00\x01" * sample_count
 
 
 class _StallingWSTTSService(TTSService):
@@ -90,6 +96,61 @@ class _StallingWSTTSService(TTSService):
             yield
 
 
+class _TruncatingWSTTSService(TTSService):
+    """WebSocket-style TTS that sends all timestamps but short audio."""
+
+    def __init__(
+        self,
+        *,
+        word_times: list[tuple[str, float]],
+        audio_seconds: float,
+        deliver_done: bool = True,
+        **kwargs,
+    ):
+        super().__init__(
+            push_start_frame=True,
+            push_text_frames=False,
+            pause_frame_processing=False,
+            sample_rate=_SAMPLE_RATE,
+            stop_frame_timeout_s=0.2,
+            **kwargs,
+        )
+        self._word_times = word_times
+        self._audio_seconds = audio_seconds
+        self._deliver_done = deliver_done
+
+    def can_generate_metrics(self) -> bool:
+        return False
+
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
+        async def _deliver():
+            await asyncio.sleep(0.01)
+            await self.add_word_timestamps(
+                self._word_times,
+                context_id=context_id,
+                includes_inter_frame_spaces=False,
+                pre_merge_tokens=False,
+            )
+            await self.append_to_audio_context(
+                context_id,
+                TTSAudioRawFrame(
+                    audio=_fake_audio_for_seconds(self._audio_seconds),
+                    sample_rate=_SAMPLE_RATE,
+                    num_channels=1,
+                    context_id=context_id,
+                ),
+            )
+            if self._deliver_done:
+                await self.append_to_audio_context(
+                    context_id, TTSStoppedFrame(context_id=context_id)
+                )
+                await self.remove_audio_context(context_id)
+
+        self.create_task(_deliver(), name=f"truncating_deliver_{context_id}")
+        if False:
+            yield
+
+
 async def _run_stall_scenario(tts: _StallingWSTTSService) -> tuple:
     # SleepFrame keeps the EndFrame away long enough for the 0.2s
     # audio-context idle timeout to fire and be processed.
@@ -98,6 +159,24 @@ async def _run_stall_scenario(tts: _StallingWSTTSService) -> tuple:
         frames_to_send=[
             TTSSpeakFrame(text="hello world tail", append_to_context=False),
             SleepFrame(0.8),
+        ],
+    )
+
+
+async def _run_truncation_scenario(
+    tts: _TruncatingWSTTSService,
+    *,
+    sleep: float = 0.4,
+) -> tuple:
+    return await run_test(
+        tts,
+        frames_to_send=[
+            TTSSpeakFrame(
+                text="hello world tail",
+                retry_group_id="retry-utterance-1",
+                append_to_context=False,
+            ),
+            SleepFrame(sleep),
         ],
     )
 
@@ -129,6 +208,69 @@ async def test_stall_detection_disabled_by_default():
 
     assert not [f for f in up if isinstance(f, TTSErrorFrame)]
     assert tts.stalled_context_ids == []
+
+
+@pytest.mark.asyncio
+async def test_done_with_all_timestamps_and_partial_audio_pushes_truncation_error():
+    tts = _TruncatingWSTTSService(
+        word_times=[("hello", 0.0), ("world", 0.8), ("tail", 2.0)],
+        audio_seconds=0.4,
+        error_on_truncated_context=True,
+    )
+
+    _, up = await _run_truncation_scenario(tts)
+
+    errors = [f for f in up if isinstance(f, TTSErrorFrame)]
+    assert len(errors) == 1
+    error = errors[0]
+    assert error.text == "world tail"
+    assert error.tts_context_id
+    assert error.retry_group_id == "retry-utterance-1"
+    assert "truncated" in error.error
+
+
+@pytest.mark.asyncio
+async def test_done_with_all_timestamps_and_full_audio_does_not_error():
+    tts = _TruncatingWSTTSService(
+        word_times=[("hello", 0.0), ("world", 0.8), ("tail", 2.0)],
+        audio_seconds=2.4,
+        error_on_truncated_context=True,
+    )
+
+    _, up = await _run_truncation_scenario(tts)
+
+    assert not [f for f in up if isinstance(f, TTSErrorFrame)]
+
+
+@pytest.mark.asyncio
+async def test_short_utterance_below_truncation_threshold_does_not_error():
+    tts = _TruncatingWSTTSService(
+        word_times=[("hello", 0.0), ("tail", 0.9)],
+        audio_seconds=0.1,
+        error_on_truncated_context=True,
+    )
+
+    _, up = await _run_truncation_scenario(tts)
+
+    assert not [f for f in up if isinstance(f, TTSErrorFrame)]
+
+
+@pytest.mark.asyncio
+async def test_timeout_with_all_timestamps_and_partial_audio_pushes_truncation_error():
+    tts = _TruncatingWSTTSService(
+        word_times=[("hello", 0.0), ("world", 0.8), ("tail", 2.0)],
+        audio_seconds=0.4,
+        deliver_done=False,
+        error_on_stalled_context=True,
+        error_on_truncated_context=True,
+    )
+
+    _, up = await _run_truncation_scenario(tts, sleep=0.8)
+
+    errors = [f for f in up if isinstance(f, TTSErrorFrame)]
+    assert len(errors) == 1
+    assert errors[0].text == "world tail"
+    assert "timeout" in errors[0].error
 
 
 @pytest.mark.asyncio

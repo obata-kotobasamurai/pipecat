@@ -589,7 +589,7 @@ class WordCompletionTracker:
 
     @property
     def last_symbol_consumption_skipped(self) -> bool:
-        """True when the last added word was a symbol-only token whose llm consumption was skipped.
+        """Return whether the last symbol-only word skipped LLM consumption.
 
         Set when ``llm_text`` is present but the symbol had no counterpart at the
         llm cursor — meaning it was already consumed elsewhere (typically as the

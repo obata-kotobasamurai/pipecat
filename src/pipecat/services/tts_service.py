@@ -11,7 +11,7 @@ import uuid
 import warnings
 from abc import abstractmethod
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import (
     Any,
@@ -106,6 +106,63 @@ class _WordTimestampEntry:
     includes_inter_frame_spaces: bool = False
 
 
+@dataclass
+class _TimestampedWord:
+    """Internal: word timestamp retained for context-level audio accounting."""
+
+    word: str
+    timestamp: float
+    includes_inter_frame_spaces: bool = False
+
+
+@dataclass
+class TTSAudioContextStats:
+    """Audio and word-timestamp accounting for one TTS audio context."""
+
+    audio_chunk_count: int = 0
+    audio_bytes: int = 0
+    audio_seconds: float = 0.0
+    timestamp_word_count: int = 0
+    expected_audio_seconds: float = 0.0
+    end_reason: str | None = None
+    _timestamped_words: list[_TimestampedWord] = field(default_factory=list)
+
+    def add_audio(self, frame: TTSAudioRawFrame):
+        """Accumulate received PCM audio duration from a raw audio frame."""
+        self.audio_chunk_count += 1
+        self.audio_bytes += len(frame.audio)
+        bytes_per_second = frame.sample_rate * 2 * frame.num_channels
+        if bytes_per_second > 0:
+            self.audio_seconds += len(frame.audio) / bytes_per_second
+
+    def add_word(
+        self,
+        word: str,
+        timestamp: float,
+        *,
+        includes_inter_frame_spaces: bool = False,
+    ):
+        """Accumulate a word timestamp for expected-duration and tail recovery."""
+        self.timestamp_word_count += 1
+        self.expected_audio_seconds = max(self.expected_audio_seconds, timestamp)
+        self._timestamped_words.append(
+            _TimestampedWord(
+                word=word,
+                timestamp=timestamp,
+                includes_inter_frame_spaces=includes_inter_frame_spaces,
+            )
+        )
+
+    def tail_text_after_audio(self) -> str:
+        """Return timestamp words whose start time is after received audio."""
+        tail = [entry for entry in self._timestamped_words if entry.timestamp > self.audio_seconds]
+        if not tail:
+            return ""
+        if any(entry.includes_inter_frame_spaces for entry in tail):
+            return "".join(entry.word for entry in tail).strip()
+        return " ".join(entry.word for entry in tail).strip()
+
+
 class TTSService(AIService):
     """Base class for text-to-speech services.
 
@@ -163,6 +220,11 @@ class TTSService(AIService):
         # "done" signal (e.g. Cartesia) — for services that rely on this timeout
         # as their regular completion path it would produce false errors.
         error_on_stalled_context: bool = False,
+        # if True, context completion checks received audio duration against
+        # word timestamps and pushes a TTSErrorFrame for the likely unspoken tail
+        # when the audio is materially short despite a clean end signal.
+        error_on_truncated_context: bool = False,
+        truncation_gap_threshold_s: float = 1.2,
         # if True, TTSService will push silence audio frames after TTSStoppedFrame
         push_silence_after_stop: bool = False,
         # if push_silence_after_stop is True, send this amount of audio silence
@@ -215,6 +277,11 @@ class TTSService(AIService):
             error_on_stalled_context: Whether an audio-context idle timeout with unspoken
                 word-timestamp text remaining should push a TTSErrorFrame carrying that text
                 (mid-stream stall detection). See the parameter comment for caveats.
+            error_on_truncated_context: Whether a cleanly ended or timed-out context with
+                complete word timestamps but materially short received audio should push a
+                TTSErrorFrame carrying the timestamp-derived unspoken tail.
+            truncation_gap_threshold_s: Minimum expected-minus-received audio gap before
+                truncation detection emits a TTSErrorFrame.
             push_silence_after_stop: Whether to push silence audio after TTSStoppedFrame.
             silence_time_s: Duration of silence to push when push_silence_after_stop is True.
             pause_frame_processing: Whether to pause frame processing during audio generation.
@@ -291,6 +358,8 @@ class TTSService(AIService):
         self._push_start_frame: bool = push_start_frame
         self._stop_frame_timeout_s: float = stop_frame_timeout_s
         self._error_on_stalled_context: bool = error_on_stalled_context
+        self._error_on_truncated_context: bool = error_on_truncated_context
+        self._truncation_gap_threshold_s: float = truncation_gap_threshold_s
         self._push_silence_after_stop: bool = push_silence_after_stop
         self._silence_time_s: float = silence_time_s
         self._pause_frame_processing: bool = pause_frame_processing
@@ -365,6 +434,7 @@ class TTSService(AIService):
         self._playing_context_id: str | None = None
         self._turn_context_id: str | None = None
         self._audio_contexts: dict[str, asyncio.Queue] = {}
+        self._audio_context_stats: dict[str, TTSAudioContextStats] = {}
         self._audio_context_task: asyncio.Task | None = None
 
         # Retry-group tracking. ``retry_group_id`` is a stable identifier that
@@ -965,10 +1035,12 @@ class TTSService(AIService):
         audio_contexts = self.get_audio_contexts()
         if audio_contexts:
             for ctx_id in audio_contexts:
+                await self._notify_audio_context_finished(ctx_id, "cancel")
                 await self.on_audio_context_interrupted(context_id=ctx_id)
         # All audio contexts are dropped on interruption, so their retry-group
         # associations are no longer needed.
         self._retry_group_by_context.clear()
+        self._audio_context_stats.clear()
         self._pending_retry_group_id = None
         self.reset_active_audio_context()
         self._turn_context_id = None
@@ -1410,6 +1482,7 @@ class TTSService(AIService):
         """
         await self._serialization_queue.put(context_id)
         self._audio_contexts[context_id] = asyncio.Queue()
+        self._audio_context_stats[context_id] = TTSAudioContextStats()
         logger.trace(f"{self} created audio context {context_id}")
 
     async def append_to_audio_context(
@@ -1520,6 +1593,10 @@ class TTSService(AIService):
         if self.audio_context_available(context_id):
             self._audio_contexts[context_id].put_nowait(TTSService._CONTEXT_KEEPALIVE)
 
+    def _cleanup_audio_context_stats(self, context_id: str | None):
+        if context_id:
+            self._audio_context_stats.pop(context_id, None)
+
     def _create_audio_context_task(self):
         if not self._audio_context_task:
             self._audio_contexts: dict[str, asyncio.Queue] = {}
@@ -1559,6 +1636,7 @@ class TTSService(AIService):
                 del self._audio_contexts[context_id]
                 self._cleanup_retry_group(context_id)
                 await self.on_audio_context_completed(context_id=context_id)
+                self._cleanup_audio_context_stats(context_id)
                 self.reset_active_audio_context()
             else:
                 running = False
@@ -1628,6 +1706,7 @@ class TTSService(AIService):
         running = True
         timestamps_started = False
         should_push_stop_frame = False
+        context_finished_notified = False
         while running:
             try:
                 frame = await asyncio.wait_for(queue.get(), timeout=self._stop_frame_timeout_s)
@@ -1639,6 +1718,13 @@ class TTSService(AIService):
                 elif isinstance(frame, _WordTimestampEntry):
                     # Route word timestamps through _add_word_timestamps so they are
                     # processed in playback order alongside audio frames.
+                    stats = self._audio_context_stats.get(context_id)
+                    if stats:
+                        stats.add_word(
+                            frame.word,
+                            frame.timestamp,
+                            includes_inter_frame_spaces=frame.includes_inter_frame_spaces,
+                        )
                     await self._add_word_timestamps(
                         [(frame.word, frame.timestamp)],
                         frame.context_id,
@@ -1646,6 +1732,9 @@ class TTSService(AIService):
                     )
                     continue
                 elif isinstance(frame, TTSAudioRawFrame):
+                    stats = self._audio_context_stats.get(context_id)
+                    if stats:
+                        stats.add_audio(frame)
                     # Set the word-timestamp baseline once, on the first audio chunk.
                     if not timestamps_started:
                         await self.stop_ttfb_metrics()
@@ -1675,23 +1764,41 @@ class TTSService(AIService):
                         await self.push_error_frame(frame)
                     else:
                         await self.push_frame(frame)
+
+                    if isinstance(frame, TTSStoppedFrame):
+                        await self._maybe_push_truncated_context_error(context_id, "done")
+                        await self._notify_audio_context_finished(context_id, "done")
+                        context_finished_notified = True
             except TimeoutError:
                 # We didn't get audio, so let's consider this context finished.
                 logger.trace(f"{self} time out on audio context {context_id}")
                 if should_push_stop_frame and self._push_stop_frames:
                     await self.push_frame(TTSStoppedFrame(context_id=context_id))
                     should_push_stop_frame = False
-                await self._maybe_push_stalled_context_error(context_id)
+                stats = self._audio_context_stats.get(context_id)
+                if not stats or stats.end_reason is None:
+                    stalled_error_pushed = await self._maybe_push_stalled_context_error(context_id)
+                    if not stalled_error_pushed:
+                        await self._maybe_push_truncated_context_error(context_id, "timeout")
+                    await self._notify_audio_context_finished(context_id, "timeout")
+                context_finished_notified = True
                 break
 
         await self._apply_force_complete(context_id)
 
         if should_push_stop_frame and self._push_stop_frames:
             await self.push_frame(TTSStoppedFrame(context_id=context_id))
+            await self._maybe_push_truncated_context_error(context_id, "done")
+            await self._notify_audio_context_finished(context_id, "done")
+            context_finished_notified = True
+
+        if not context_finished_notified:
+            await self._maybe_push_truncated_context_error(context_id, "done")
+            await self._notify_audio_context_finished(context_id, "done")
 
         await self._maybe_reset_word_timestamps(context_id)
 
-    async def _maybe_push_stalled_context_error(self, context_id: str):
+    async def _maybe_push_stalled_context_error(self, context_id: str) -> bool:
         """Surface a mid-stream synthesis stall as a TTSErrorFrame.
 
         Called from the audio-context idle-timeout path. When
@@ -1709,12 +1816,18 @@ class TTSService(AIService):
 
         Args:
             context_id: The audio context that timed out while playing.
+
+        Returns:
+            True if a TTSErrorFrame was pushed.
         """
+        stats = self._audio_context_stats.get(context_id)
+        if stats and stats.end_reason is not None:
+            return False
         if not self._error_on_stalled_context:
-            return
+            return False
         remaining_text = self._aggregated_frame_sequencer.peek_remaining_text(context_id)
         if not remaining_text:
-            return
+            return False
         logger.warning(
             f"{self} audio context {context_id} stalled: no audio for "
             f"{self._stop_frame_timeout_s:.1f}s with unspoken text {remaining_text!r}"
@@ -1734,6 +1847,79 @@ class TTSService(AIService):
                 retry_group_id=self._retry_group_for_context(context_id),
             )
         )
+        return True
+
+    async def _maybe_push_truncated_context_error(self, context_id: str, end_reason: str) -> bool:
+        """Surface a context that ended with less audio than its timestamps imply.
+
+        Some providers can send a complete word-timestamp stream and a clean
+        end signal while only delivering the first part of the PCM audio. The
+        sequencer then sees every word as complete, so force-complete and stall
+        detection have no remaining slot text to retry. This check compares the
+        received audio duration with the final timestamp and retries the
+        timestamp-derived tail when the gap is larger than the configured
+        threshold.
+
+        Args:
+            context_id: The audio context that ended.
+            end_reason: Provider/end path label for logs and error text.
+
+        Returns:
+            True if a TTSErrorFrame was pushed.
+        """
+        stats = self._audio_context_stats.get(context_id)
+        if stats and stats.end_reason is not None:
+            return False
+        if not self._error_on_truncated_context:
+            return False
+        if not stats or stats.timestamp_word_count == 0:
+            return False
+
+        gap_s = stats.expected_audio_seconds - stats.audio_seconds
+        if gap_s <= self._truncation_gap_threshold_s:
+            return False
+
+        remaining_text = stats.tail_text_after_audio()
+        if not remaining_text:
+            remaining_text = self._aggregated_frame_sequencer.peek_remaining_text(context_id)
+        if not remaining_text:
+            logger.warning(
+                f"{self} audio context {context_id} appears truncated on {end_reason}: "
+                f"expected_audio={stats.expected_audio_seconds:.3f}s "
+                f"received_audio={stats.audio_seconds:.3f}s gap={gap_s:.3f}s "
+                f"threshold={self._truncation_gap_threshold_s:.3f}s, "
+                "but no retryable tail text could be recovered"
+            )
+            return False
+
+        logger.warning(
+            f"{self} audio context {context_id} truncated on {end_reason}: "
+            f"expected_audio={stats.expected_audio_seconds:.3f}s "
+            f"received_audio={stats.audio_seconds:.3f}s gap={gap_s:.3f}s "
+            f"threshold={self._truncation_gap_threshold_s:.3f}s tail={remaining_text!r}"
+        )
+        await self.push_error_frame(
+            TTSErrorFrame(
+                error=(
+                    "TTS audio context truncated: received audio duration was "
+                    f"{gap_s:.3f}s shorter than word timestamps on {end_reason}"
+                ),
+                text=remaining_text,
+                tts_context_id=context_id,
+                retry_group_id=self._retry_group_for_context(context_id),
+            )
+        )
+        return True
+
+    async def _notify_audio_context_finished(self, context_id: str, end_reason: str):
+        stats = self._audio_context_stats.get(context_id)
+        if not stats or stats.end_reason is not None:
+            return
+        stats.end_reason = end_reason
+        try:
+            await self.on_audio_context_finished(context_id, end_reason, stats)
+        except Exception as e:
+            logger.warning(f"{self} on_audio_context_finished failed: {e}")
 
     async def on_audio_context_stalled(self, context_id: str):
         """Called when a playing audio context stalls mid-stream.
@@ -1746,6 +1932,18 @@ class TTSService(AIService):
 
         Args:
             context_id: The ID of the audio context that stalled.
+        """
+        pass
+
+    async def on_audio_context_finished(
+        self, context_id: str, end_reason: str, stats: TTSAudioContextStats
+    ):
+        """Called when an audio context reaches a terminal path.
+
+        Args:
+            context_id: The ID of the audio context that finished.
+            end_reason: One of ``done``, ``timeout``, ``error``, or ``cancel``.
+            stats: Audio/timestamp accounting gathered while the context played.
         """
         pass
 
