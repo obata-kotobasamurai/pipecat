@@ -1168,5 +1168,107 @@ class TestForceCompleteContextScoped(unittest.TestCase):
         self.assertEqual(texts, ["one", "two"])
 
 
+# ---------------------------------------------------------------------------
+# process_word attribution across concurrently-live contexts
+# ---------------------------------------------------------------------------
+
+
+class TestConcurrentContextWordAttribution(unittest.TestCase):
+    """Words must be attributed by context_id, not by queue position.
+
+    Two spoken slots are live at once whenever a TTS cache sits in front of the
+    provider: a cache-hit utterance completes locally almost instantly while a
+    preceding cache-miss utterance is still streaming. Selecting the active slot
+    by queue order alone hands the second context's words to the first slot.
+
+    Reproduces the production failure where a pre-tool filler (cache miss, still
+    streaming) swallowed a post-tool filler's words (cache hit), fusing both into
+    one context message and dropping the tail:
+
+        "お客様情報を確認いたしますので、少々お待ちください。お待たせ"
+                                                        ^^^^^^ 「いたしました。」 lost
+    """
+
+    def test_second_context_words_do_not_feed_the_first_open_slot(self):
+        seq = _seq()
+        # ctx-miss registered first and is still streaming (incomplete).
+        seq.register_spoken(_spoken_frame("alpha beta"), "ctx-miss", _tracker("alpha beta"), True)
+        # ctx-hit is produced by the cache while ctx-miss is still open.
+        seq.register_spoken(_spoken_frame("gamma delta"), "ctx-hit", _tracker("gamma delta"), True)
+
+        # A word belonging to ctx-hit arrives before ctx-miss has finished.
+        frames = seq.process_word("gamma", pts=10, context_id="ctx-hit")
+        tts = [f for f in frames if isinstance(f, TTSTextFrame)]
+        self.assertEqual(len(tts), 1)
+        self.assertEqual(tts[0].text, "gamma")
+        self.assertEqual(
+            tts[0].context_id,
+            "ctx-hit",
+            "word must stay attributed to the context that produced it",
+        )
+
+        # ctx-miss must be untouched: its own words still complete it normally.
+        frames = seq.process_word("alpha", pts=20, context_id="ctx-miss")
+        frames += seq.process_word("beta", pts=30, context_id="ctx-miss")
+        texts = [f.text for f in frames if isinstance(f, TTSTextFrame)]
+        self.assertEqual(texts, ["alpha", "beta"])
+
+    def test_interleaved_contexts_keep_their_own_text(self):
+        seq = _seq()
+        seq.register_spoken(_spoken_frame("one two"), "ctx-a", _tracker("one two"), True)
+        seq.register_spoken(_spoken_frame("three four"), "ctx-b", _tracker("three four"), True)
+
+        by_ctx: dict[str, list[str]] = {"ctx-a": [], "ctx-b": []}
+        # Fully interleaved arrival order, as happens when cache and live audio
+        # drain concurrently.
+        for word, ctx, pts in [
+            ("one", "ctx-a", 10),
+            ("three", "ctx-b", 11),
+            ("two", "ctx-a", 20),
+            ("four", "ctx-b", 21),
+        ]:
+            for f in seq.process_word(word, pts=pts, context_id=ctx):
+                if isinstance(f, TTSTextFrame) and f.append_to_context:
+                    by_ctx[f.context_id].append(f.text)
+
+        self.assertEqual(by_ctx["ctx-a"], ["one", "two"])
+        self.assertEqual(by_ctx["ctx-b"], ["three", "four"])
+
+    def test_second_context_tail_is_not_dropped(self):
+        seq = _seq()
+        seq.register_spoken(_spoken_frame("aa bb"), "ctx-miss", _tracker("aa bb"), True)
+        seq.register_spoken(_spoken_frame("cc dd"), "ctx-hit", _tracker("cc dd"), True)
+
+        # Drain ctx-hit completely while ctx-miss is still open. Without
+        # context-scoped selection its words land in ctx-miss, which completes
+        # after two words and discards the rest.
+        collected = []
+        for word in ("cc", "dd"):
+            for f in seq.process_word(word, pts=10, context_id="ctx-hit"):
+                if isinstance(f, TTSTextFrame):
+                    collected.append(f.text)
+
+        self.assertEqual(collected, ["cc", "dd"], "cache-hit utterance lost its tail")
+
+    def test_single_context_behavior_is_unchanged(self):
+        """The common single-context turn must behave exactly as before."""
+        seq = _seq()
+        seq.register_spoken(_spoken_frame("hello world"), "ctx1", _tracker("hello world"), True)
+
+        frames = seq.process_word("hello", pts=10, context_id="ctx1")
+        frames += seq.process_word("world", pts=20, context_id="ctx1")
+        texts = [f.text for f in frames if isinstance(f, TTSTextFrame)]
+        self.assertEqual(texts, ["hello", "world"])
+
+    def test_word_with_no_context_id_still_uses_queue_order(self):
+        """Services without audio contexts pass context_id=None; keep FIFO."""
+        seq = _seq()
+        seq.register_spoken(_spoken_frame("first"), "ctx1", _tracker("first"), True)
+
+        frames = seq.process_word("first", pts=10, context_id=None)
+        texts = [f.text for f in frames if isinstance(f, TTSTextFrame)]
+        self.assertEqual(texts, ["first"])
+
+
 if __name__ == "__main__":
     unittest.main()

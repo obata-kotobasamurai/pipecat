@@ -181,9 +181,19 @@ class AggregatedFrameSequencer:
             )
             return []
 
-        active = self._get_active_slot()
+        active = self._get_active_slot(context_id)
         is_complete = False
         raw_overflow_word = None
+
+        # Routing straight to a matching context can skip over older incomplete
+        # slots. Those slots' audio is already done (their context only stays
+        # open because the provider stopped sending timestamps for it), so retire
+        # them now. The queue-order path reached the same end state via
+        # force-complete; doing it explicitly keeps skipped frames behind them
+        # from being blocked forever.
+        pending_flush: list[Frame] = []
+        if active is not None and active.context_id == context_id:
+            pending_flush = self._retire_slots_before(active)
 
         # A symbol-only word (normalizes to nothing — punctuation, emoji) that no
         # slot claims is most commonly a trailing-punctuation timestamp event
@@ -231,7 +241,7 @@ class AggregatedFrameSequencer:
                     )
                     if is_symbol_only:
                         frame.append_to_context = False
-                    return [frame]
+                    return [*pending_flush, frame]
 
             is_complete = active.tracker.add_word_and_check_complete(word)
             raw_overflow_word = active.tracker.get_overflow_word()
@@ -273,7 +283,9 @@ class AggregatedFrameSequencer:
         ):
             word_frame.append_to_context = False
 
-        frames: list[Frame] = [word_frame]
+        # Frames released by retiring older slots precede this word in the
+        # timeline, so they must be emitted first.
+        frames: list[Frame] = [*pending_flush, word_frame]
 
         if active and active.tracker:
             frames.append(self._build_progress_frame(active, pts))
@@ -422,12 +434,65 @@ class AggregatedFrameSequencer:
     # Internal helpers
     # -------------------------------------------------------------------------
 
-    def _get_active_slot(self) -> _AggregatedFrameSlot | None:
-        """Return the first incomplete spoken slot that has a tracker."""
+    def _get_active_slot(self, context_id: str | None = None) -> _AggregatedFrameSlot | None:
+        """Return the incomplete spoken slot a word should be attributed to.
+
+        When ``context_id`` is given and a live slot carries that exact id, that
+        slot wins over simple queue order. Word-timestamp events name the context
+        they belong to, so honouring that id is the only correct attribution when
+        two contexts are in flight at once.
+
+        That happens routinely once a TTS cache sits in front of the provider: a
+        cache-hit utterance is produced locally and completes almost instantly,
+        while a preceding cache-miss utterance is still streaming from the
+        provider. Both slots are then incomplete simultaneously, and pure queue
+        order hands the cache-hit's words to the still-open miss slot. The miss
+        slot consumes them until its own llm_text runs out, so the two utterances
+        fuse into one context message and the tail of the second is dropped —
+        observed in production as
+        "お客様情報を確認いたしますので、少々お待ちください。お待たせ", where
+        「いたしました。」 was lost even though the audio played in full.
+
+        Falls back to first-incomplete-slot order when no id is supplied or no
+        live slot matches, preserving behaviour for single-context turns and for
+        services whose word events carry no context id.
+        """
+        if context_id is not None:
+            matching = next(
+                (
+                    s
+                    for s in self._slots
+                    if s.context_id == context_id
+                    and s.spoken
+                    and not s.complete
+                    and s.tracker is not None
+                ),
+                None,
+            )
+            if matching is not None:
+                return matching
         return next(
             (s for s in self._slots if s.spoken and not s.complete and s.tracker is not None),
             None,
         )
+
+    def _retire_slots_before(self, target: _AggregatedFrameSlot) -> list[Frame]:
+        """Complete any incomplete spoken slots queued ahead of *target*.
+
+        Used when a word is routed to a matching context that is not at the head
+        of the queue. Older slots are finished as far as audio is concerned, so
+        marking them complete releases skipped frames waiting behind them and
+        keeps :meth:`flush` from stalling on a slot that will never receive
+        another word.
+        """
+        retired = False
+        for slot in self._slots:
+            if slot is target:
+                break
+            if slot.spoken and not slot.complete:
+                slot.complete = True
+                retired = True
+        return self.flush() if retired else []
 
     def _get_next_active_slot(self, current: _AggregatedFrameSlot) -> _AggregatedFrameSlot | None:
         """Return the first incomplete spoken slot with a tracker after *current*."""
