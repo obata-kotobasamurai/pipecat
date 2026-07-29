@@ -377,6 +377,14 @@ class CartesiaTTSService(WebsocketTTSService):
 
         self._receive_task = None
 
+        # Per-context transcript boundary bookkeeping. ``_flush_sent`` counts the
+        # boundary flushes this side has issued for a context (mirroring the
+        # server's 1-based ``flush_id``); ``_flush_waiters`` holds one event per
+        # awaited flush_id so callers can block until that transcript's audio has
+        # finished arriving. Both are cleared when the context goes away.
+        self._flush_sent: dict[str, int] = {}
+        self._flush_waiters: dict[tuple[str, int], asyncio.Event] = {}
+
     def can_generate_metrics(self) -> bool:
         """Check if this service can generate processing metrics.
 
@@ -498,6 +506,7 @@ class CartesiaTTSService(WebsocketTTSService):
         continue_transcript: bool = True,
         add_timestamps: bool = True,
         context_id: str = "",
+        flush: bool = False,
     ):
         voice_config = {}
         voice_config["mode"] = "id"
@@ -517,6 +526,14 @@ class CartesiaTTSService(WebsocketTTSService):
             "add_timestamps": add_timestamps,
             "use_normalized_timestamps": False,
         }
+
+        # ``flush`` asks Cartesia to close the current transcript boundary while
+        # keeping the context open (unlike ``continue=False``, which ends it).
+        # The server answers with ``flush_done`` carrying an incrementing
+        # ``flush_id``, and tags this transcript's audio chunks with the same id,
+        # which is what lets a caller tell whose audio has finished arriving.
+        if flush:
+            msg["flush"] = True
 
         if self._max_buffer_delay_ms is not None:
             msg["max_buffer_delay_ms"] = self._max_buffer_delay_ms
@@ -669,7 +686,87 @@ class CartesiaTTSService(WebsocketTTSService):
             f"expected_audio_seconds={stats.expected_audio_seconds:.3f} "
             f"end_reason={end_reason}"
         )
+        # The context is over (done, error, or interruption): no further
+        # flush_done can arrive for it, so release waiters rather than letting
+        # them sit until their timeout.
+        self._discard_flush_state(context_id)
         await super().on_audio_context_finished(context_id, end_reason, stats)
+
+    async def _handle_flush_done(self, context_id: str, flush_id: Any) -> None:
+        """Release anything waiting on this transcript boundary.
+
+        ``flush_id`` is the server's 1-based counter for the context. Waiters
+        registered for this (context_id, flush_id) are woken; earlier ids are
+        woken too, since a later boundary implies every earlier one completed
+        (a dropped flush_done must not strand a waiter forever).
+        """
+        if flush_id is None:
+            return
+        try:
+            completed = int(flush_id)
+        except (TypeError, ValueError):
+            logger.debug(f"{self}: ignoring flush_done with non-numeric flush_id {flush_id!r}")
+            return
+        for (ctx, pending_id), event in list(self._flush_waiters.items()):
+            if ctx == context_id and pending_id <= completed:
+                event.set()
+                self._flush_waiters.pop((ctx, pending_id), None)
+
+    async def flush_transcript_boundary(self, context_id: str) -> int | None:
+        """Close the current transcript inside ``context_id`` without ending it.
+
+        Sends ``continue=true, flush=true``, so the context stays open for more
+        transcripts while the server marks a boundary and replies with
+        ``flush_done`` for the returned id.
+
+        Returns:
+            The 1-based flush id to await, or ``None`` if nothing was sent.
+        """
+        if not context_id or not self._websocket:
+            return None
+        next_id = self._flush_sent.get(context_id, 0) + 1
+        self._flush_sent[context_id] = next_id
+        msg = self._build_msg(
+            text="", continue_transcript=True, context_id=context_id, flush=True
+        )
+        await self._websocket.send(msg)
+        return next_id
+
+    async def wait_for_flush_done(
+        self, context_id: str, flush_id: int, timeout: float = 30.0
+    ) -> bool:
+        """Block until the given transcript boundary has been acknowledged.
+
+        Returns:
+            True if ``flush_done`` arrived, False on timeout or if the context
+            disappeared (interruption, error) — callers should treat False as
+            "ordering is no longer guaranteed" and fall back accordingly.
+        """
+        if not self.audio_context_available(context_id):
+            return False
+        key = (context_id, flush_id)
+        event = self._flush_waiters.setdefault(key, asyncio.Event())
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"{self}: timed out waiting for flush_done "
+                f"context={context_id} flush_id={flush_id}"
+            )
+            return False
+        finally:
+            self._flush_waiters.pop(key, None)
+
+    def _discard_flush_state(self, context_id: str | None) -> None:
+        """Drop boundary bookkeeping for a context and wake anyone still waiting."""
+        if not context_id:
+            return
+        self._flush_sent.pop(context_id, None)
+        for (ctx, pending_id), event in list(self._flush_waiters.items()):
+            if ctx == context_id:
+                event.set()
+                self._flush_waiters.pop((ctx, pending_id), None)
 
     async def flush_audio(self, context_id: str | None = None):
         """Flush any pending audio and finalize the current context.
@@ -751,11 +848,18 @@ class CartesiaTTSService(WebsocketTTSService):
                 self.reset_active_audio_context()
             elif msg["type"] == "flush_done":
                 # Cartesia emits flush_done as a per-transcript boundary marker
-                # within a context (e.g. when max_buffer_delay_ms=0 causes the
-                # server to flush each submission). We don't need it: each turn
-                # already has its own context_id and audio chunks are tagged
-                # with it. Acknowledge silently.
-                pass
+                # within a context: every transcript submitted to one context
+                # shares that context_id, so context_id alone cannot say *whose*
+                # audio has finished. ``flush_id`` (1-based, incremented per
+                # flush) does, and the matching chunks carry it too.
+                #
+                # A caller that interleaves locally-produced audio (cache hits,
+                # recorded PCM) with server-streamed audio in the same context
+                # needs this signal: the server's audio arrives asynchronously
+                # via this receive loop, so without a per-transcript completion
+                # marker the only safe option is to stop using local audio for
+                # the rest of the turn once one sentence goes to the server.
+                await self._handle_flush_done(ctx_id, msg.get("flush_id"))
             else:
                 await self.push_error(error_msg=f"Error, unknown message type: {msg}")
 
