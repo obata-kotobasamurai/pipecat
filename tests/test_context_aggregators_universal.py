@@ -61,7 +61,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
     UserTurnMessageAddedMessage,
     UserTurnStoppedMessage,
 )
-from pipecat.processors.frame_processor import FrameDirection
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.tests.utils import SleepFrame, run_test
 from pipecat.turns.user_mute import (
     FirstSpeechUserMuteStrategy,
@@ -1138,6 +1138,9 @@ class TestLLMAssistantAggregator(unittest.IsolatedAsyncioTestCase):
         expected_down_frames = [
             LLMContextFrame,
             LLMContextAssistantTimestampFrame,
+            # The orphan commit now runs through the regular turn-stop path,
+            # so it also announces the committed turn.
+            LLMContextAssistantTurnFrame,
             InterruptionFrame,
         ]
         await run_test(
@@ -2160,6 +2163,296 @@ class TestRealtimeServiceModeAggregator(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaises(RuntimeError):
             assistant._validate_realtime_pairing()
+
+
+class TestCausalContextCommitOrdering(unittest.IsolatedAsyncioTestCase):
+    """User-turn inference must always see already-spoken assistant text.
+
+    Goal (generalized): at the instant an LLMContextFrame is emitted to
+    trigger inference, the shared context must already contain — in causal
+    order — every assistant utterance whose words have reached the assistant
+    aggregator (i.e. speech the user has already heard, since word frames
+    are playback-paced through the transport). The commit must not depend on
+    the assistant's closing frames (LLMFullResponseEndFrame /
+    LLMAssistantPushAggregationFrame / InterruptionFrame) winning a race
+    through the pipeline.
+
+    Machine verification: a recorder between the halves snapshots the
+    context messages at the moment the inference-triggering LLMContextFrame
+    passes; the snapshot must contain the assistant message before the user
+    message. Reproduces prod call CA1c2068b2a6044ed5bf6917cd8e23ff5d
+    (2026-07-31 09:14): the spoken confirmation's closing frame lagged
+    playback end by seconds (live TTS context closed late), the user said
+    「はい」, and inference ran without the confirmation in context, so the
+    bot asked the same question again.
+    """
+
+    def _make_pair(self, context: LLMContext) -> LLMContextAggregatorPair:
+        # Mirrors the prod failure shape: transcript-driven turn start (the
+        # VAD-miss rescue path) whose stop fires from a speech timeout.
+        # Interruption broadcast is disabled so the test never depends on an
+        # InterruptionFrame racing through the pipeline — the contract under
+        # test is the synchronous flush, not frame-arrival luck.
+        return LLMContextAggregatorPair(
+            context,
+            user_params=LLMUserAggregatorParams(
+                user_turn_strategies=UserTurnStrategies(
+                    start=[
+                        TranscriptionUserTurnStartStrategy(enable_interruptions=False)
+                    ],
+                    stop=[
+                        SpeechTimeoutUserTurnStopStrategy(
+                            user_speech_timeout=TRANSCRIPTION_TIMEOUT
+                        )
+                    ],
+                ),
+            ),
+        )
+
+    def _make_pipeline(self, pair: LLMContextAggregatorPair):
+        """Pipeline user → snapshot recorder (LLM stand-in) → assistant."""
+        import copy
+
+        snapshots: list[list] = []
+
+        class _InferenceSnapshotRecorder(FrameProcessor):
+            async def process_frame(self, frame, direction):
+                await super().process_frame(frame, direction)
+                if isinstance(frame, LLMContextFrame):
+                    snapshots.append(copy.deepcopy(frame.context.get_messages()))
+                await self.push_frame(frame, direction)
+
+        pipeline = Pipeline(
+            [pair.user(), _InferenceSnapshotRecorder(), pair.assistant()]
+        )
+        return pipeline, snapshots
+
+    async def test_user_turn_commits_played_assistant_text_before_inference(self):
+        """Main repro: closing frame in flight → user replies → no loss."""
+        context = LLMContext()
+        pair = self._make_pair(context)
+        pipeline, snapshots = self._make_pipeline(pair)
+
+        confirmation = "ロイヤルゼリーキングの次回お届け日を8月3日に変更でよろしいでしょうか？"
+        frames_to_send = [
+            # Assistant turn opens and its words reach the aggregator
+            # playback-paced. The closing LLMFullResponseEndFrame is still in
+            # flight (live TTS context closes seconds after playback end).
+            LLMFullResponseStartFrame(),
+            TTSTextFrame(confirmation, aggregated_by=AggregationType.WORD),
+            SleepFrame(),
+            # User replies right after hearing the utterance.
+            TranscriptionFrame(text="はい。", user_id="", timestamp="now"),
+            SleepFrame(sleep=TRANSCRIPTION_TIMEOUT + 0.1),
+            # The closing frame finally lands, long after inference started.
+            LLMFullResponseEndFrame(),
+            SleepFrame(),
+        ]
+        await run_test(pipeline, frames_to_send=frames_to_send)
+
+        # The inference snapshot must already contain the spoken confirmation
+        # before the user message.
+        self.assertEqual(len(snapshots), 1)
+        snapshot = snapshots[0]
+        self.assertEqual(
+            [(m["role"], m["content"]) for m in snapshot],
+            [("assistant", confirmation), ("user", "はい。")],
+        )
+        # The late closing frame must not duplicate the message.
+        messages = context.get_messages()
+        self.assertEqual(
+            [(m["role"], m["content"]) for m in messages],
+            [("assistant", confirmation), ("user", "はい。")],
+        )
+
+    async def test_barge_in_partial_words_committed_before_user_message(self):
+        """Barge-in mid-utterance: played words land before the user message."""
+        context = LLMContext()
+        pair = self._make_pair(context)
+        pipeline, snapshots = self._make_pipeline(pair)
+
+        frames_to_send = [
+            LLMFullResponseStartFrame(),
+            TTSTextFrame("ロイヤルゼリーキングの次", aggregated_by=AggregationType.WORD),  # words played so far
+            SleepFrame(),
+            TranscriptionFrame(
+                text="8月の3日に届けてもらうことできますか。", user_id="", timestamp="now"
+            ),
+            SleepFrame(sleep=TRANSCRIPTION_TIMEOUT + 0.1),
+            # The interruption reaches the tail only after inference started.
+            InterruptionFrame(),
+            SleepFrame(),
+        ]
+        await run_test(pipeline, frames_to_send=frames_to_send)
+
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(
+            [(m["role"], m["content"]) for m in snapshots[0]],
+            [
+                ("assistant", "ロイヤルゼリーキングの次"),
+                ("user", "8月の3日に届けてもらうことできますか。"),
+            ],
+        )
+        # The late InterruptionFrame commits nothing further.
+        self.assertEqual(len(context.get_messages()), 2)
+
+    async def test_consecutive_sentences_only_uncommitted_text_is_flushed(self):
+        """Sentence 1 committed normally; sentence 2 in flight — no dup, order kept."""
+        context = LLMContext()
+        pair = self._make_pair(context)
+        pipeline, snapshots = self._make_pipeline(pair)
+
+        frames_to_send = [
+            # Sentence 1: complete cycle (e.g. cache-served utterance whose
+            # closing frame arrived on time).
+            LLMFullResponseStartFrame(),
+            TTSTextFrame("ありがとうございます。", aggregated_by=AggregationType.WORD),
+            LLMFullResponseEndFrame(),
+            SleepFrame(),
+            # Sentence 2: words delivered, close in flight.
+            LLMFullResponseStartFrame(),
+            TTSTextFrame("ロイヤルゼリーキングの次回お届け日を8月3日に変更でよろしいでしょうか？", aggregated_by=AggregationType.WORD),
+            SleepFrame(),
+            TranscriptionFrame(text="はい。", user_id="", timestamp="now"),
+            SleepFrame(sleep=TRANSCRIPTION_TIMEOUT + 0.1),
+            LLMFullResponseEndFrame(),
+            SleepFrame(),
+        ]
+        await run_test(pipeline, frames_to_send=frames_to_send)
+
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(
+            [(m["role"], m["content"]) for m in snapshots[0]],
+            [
+                ("assistant", "ありがとうございます。"),
+                ("assistant", "ロイヤルゼリーキングの次回お届け日を8月3日に変更でよろしいでしょうか？"),
+                ("user", "はい。"),
+            ],
+        )
+        self.assertEqual(len(context.get_messages()), 3)
+
+    async def test_user_turn_with_no_pending_assistant_text_flushes_nothing(self):
+        context = LLMContext()
+        pair = self._make_pair(context)
+        pipeline, snapshots = self._make_pipeline(pair)
+
+        stopped_messages: list[AssistantTurnStoppedMessage] = []
+
+        @pair.assistant().event_handler("on_assistant_turn_stopped")
+        async def on_assistant_turn_stopped(aggregator, message):
+            stopped_messages.append(message)
+
+        frames_to_send = [
+            TranscriptionFrame(text="もしもし。", user_id="", timestamp="now"),
+            SleepFrame(sleep=TRANSCRIPTION_TIMEOUT + 0.1),
+        ]
+        await run_test(pipeline, frames_to_send=frames_to_send)
+
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(
+            [(m["role"], m["content"]) for m in snapshots[0]],
+            [("user", "もしもし。")],
+        )
+        self.assertEqual(stopped_messages, [])
+
+    async def test_llm_run_frame_flushes_played_assistant_text(self):
+        """Tool/flow-driven LLMRunFrame reruns also see already-spoken text."""
+        context = LLMContext()
+        pair = self._make_pair(context)
+        pipeline, snapshots = self._make_pipeline(pair)
+
+        frames_to_send = [
+            LLMFullResponseStartFrame(),
+            TTSTextFrame("お調べいたします。", aggregated_by=AggregationType.WORD),
+            SleepFrame(),
+            LLMRunFrame(),
+            SleepFrame(),
+        ]
+        await run_test(pipeline, frames_to_send=frames_to_send)
+
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(
+            [(m["role"], m["content"]) for m in snapshots[0]],
+            [("assistant", "お調べいたします。")],
+        )
+
+    async def test_orphaned_words_committed_by_any_closing_signal(self):
+        """Words landing after the turn closed are committed by the next close.
+
+        Previously only InterruptionFrame swept orphaned aggregation; a
+        non-interruption closing signal (e.g. the PTS-stamped
+        LLMAssistantPushAggregationFrame of a TTSSpeakFrame utterance)
+        silently dropped it.
+        """
+        context = LLMContext()
+        aggregator = LLMAssistantAggregator(context)
+
+        frames_to_send = [
+            LLMFullResponseStartFrame(),
+            LLMFullResponseEndFrame(),  # closes the turn before words arrive
+            TTSTextFrame("お待たせいたしました。", aggregated_by=AggregationType.WORD),  # playback-paced words, now orphaned
+            SleepFrame(),
+            LLMAssistantPushAggregationFrame(),
+            SleepFrame(),
+        ]
+        await run_test(aggregator, frames_to_send=frames_to_send)
+
+        messages = context.get_messages()
+        self.assertEqual(messages[-1]["role"], "assistant")
+        self.assertEqual(messages[-1]["content"], "お待たせいたしました。")
+
+    async def test_function_result_rerun_commits_spoken_filler_first(self):
+        """Tool-result rerun (upstream context push) flushes spoken text first."""
+        import copy
+
+        context = LLMContext()
+        aggregator = LLMAssistantAggregator(context)
+
+        snapshots: list[list] = []
+
+        class _UpstreamSnapshotRecorder(FrameProcessor):
+            async def process_frame(self, frame, direction):
+                await super().process_frame(frame, direction)
+                if (
+                    isinstance(frame, LLMContextFrame)
+                    and direction == FrameDirection.UPSTREAM
+                ):
+                    snapshots.append(copy.deepcopy(frame.context.get_messages()))
+                await self.push_frame(frame, direction)
+
+        pipeline = Pipeline([_UpstreamSnapshotRecorder(), aggregator])
+
+        frames_to_send = [
+            FunctionCallInProgressFrame(
+                function_name="verify_customer_number",
+                tool_call_id="1",
+                arguments={},
+                cancel_on_interruption=True,
+            ),
+            SleepFrame(),
+            # Filler speech plays while the tool runs; its closing frame is
+            # still in flight when the result arrives.
+            TTSStartedFrame(),
+            TTSTextFrame("お客様情報を確認いたしますので、少々お待ちください。", aggregated_by=AggregationType.WORD),
+            SleepFrame(),
+            FunctionCallResultFrame(
+                function_name="verify_customer_number",
+                tool_call_id="1",
+                arguments={},
+                result={"status": "found"},
+            ),
+            SleepFrame(),
+        ]
+        await run_test(pipeline, frames_to_send=frames_to_send)
+
+        self.assertEqual(len(snapshots), 1)
+        roles_contents = [
+            (m["role"], m.get("content")) for m in snapshots[0] if "role" in m
+        ]
+        self.assertIn(
+            ("assistant", "お客様情報を確認いたしますので、少々お待ちください。"),
+            roles_contents,
+        )
 
 
 if __name__ == "__main__":

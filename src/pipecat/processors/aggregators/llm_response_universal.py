@@ -717,6 +717,20 @@ class LLMUserAggregator(LLMContextAggregator):
         # inferences fire before finalization.
         self._full_user_turn_aggregation: str | None = None
 
+        # Pair-internal back-reference to the assistant half, set by
+        # ``LLMContextAggregatorPair``. Used to enforce causal write
+        # ordering in the shared context: before this aggregator writes a
+        # user message (and emits the LLMContextFrame that triggers
+        # inference), the assistant half synchronously commits any text it
+        # has already received — i.e. speech the user has already heard.
+        # Without this, the assistant commit depends on closing frames
+        # (LLMFullResponseEndFrame / LLMAssistantPushAggregationFrame /
+        # InterruptionFrame) physically traversing the pipeline to the
+        # assistant aggregator at the tail, which loses the race against
+        # the head-side inference trigger and produces LLM calls whose
+        # context is missing the assistant's most recent utterance.
+        self._paired_assistant_aggregator: "LLMAssistantAggregator | None" = None
+
         self._user_turn_controller = UserTurnController(
             user_turn_strategies=user_turn_strategies,
             user_turn_stop_timeout=self._params.user_turn_stop_timeout,
@@ -841,6 +855,20 @@ class LLMUserAggregator(LLMContextAggregator):
         """Push the current aggregation."""
         if len(self._aggregation) == 0:
             return ""
+
+        # Causal ordering (cascade mode): commit whatever the assistant has
+        # already spoken BEFORE this user message lands and before the
+        # LLMContextFrame below triggers inference. The assistant aggregator
+        # sits at the pipeline tail and receives its words playback-paced, so
+        # its pending aggregation at this instant is exactly the speech the
+        # user heard before replying. Doing this via a direct call (same
+        # event loop, shared context) instead of waiting for the assistant's
+        # closing frame makes the ordering deterministic by construction.
+        # Realtime mode is excluded: there the assistant response *follows*
+        # the user turn and its trailing aggregation may be mid-stream when
+        # the deferred user handoff flush runs — flushing it here would
+        # invert the order.
+        await self._maybe_flush_paired_spoken_aggregation()
 
         aggregation = self.aggregation_string()
         await self.reset()
@@ -1089,22 +1117,37 @@ class LLMUserAggregator(LLMContextAggregator):
 
         return should_mute_frame
 
+    async def _maybe_flush_paired_spoken_aggregation(self):
+        """Commit already-spoken assistant text before triggering inference.
+
+        Cascade-mode causal ordering — see ``push_aggregation``. Applied to
+        every user-side inference trigger (user message writes, LLMRunFrame,
+        message append/update/transform with ``run_llm``) so no trigger can
+        snapshot a context that is missing speech the user already heard.
+        """
+        if not self._realtime_service_mode and self._paired_assistant_aggregator is not None:
+            await self._paired_assistant_aggregator.flush_spoken_aggregation()
+
     async def _handle_llm_run(self, frame: LLMRunFrame):
+        await self._maybe_flush_paired_spoken_aggregation()
         await self.push_context_frame()
 
     async def _handle_llm_messages_append(self, frame: LLMMessagesAppendFrame):
         self.add_messages(frame.messages)
         if frame.run_llm:
+            await self._maybe_flush_paired_spoken_aggregation()
             await self.push_context_frame()
 
     async def _handle_llm_messages_update(self, frame: LLMMessagesUpdateFrame):
         self.set_messages(frame.messages)
         if frame.run_llm:
+            await self._maybe_flush_paired_spoken_aggregation()
             await self.push_context_frame()
 
     async def _handle_llm_messages_transform(self, frame: LLMMessagesTransformFrame):
         self.transform_messages(frame.transform)
         if frame.run_llm:
+            await self._maybe_flush_paired_spoken_aggregation()
             await self.push_context_frame()
 
     async def _handle_transcription(self, frame: TranscriptionFrame):
@@ -1591,8 +1634,35 @@ class LLMAssistantAggregator(LLMContextAggregator):
         Args:
             direction: The direction to push the frame (upstream or downstream).
         """
+        if direction == FrameDirection.UPSTREAM:
+            # Upstream pushes are inference triggers (function-call results,
+            # LLMRunFrame, deferred pushes on BotStoppedSpeaking). Commit any
+            # already-spoken text first so the inference sees it. Downstream
+            # pushes come from push_aggregation itself and must not recurse.
+            await self.flush_spoken_aggregation()
         await super().push_context_frame(direction)
         self._push_context_on_bot_stopped_speaking = False
+
+    async def flush_spoken_aggregation(self):
+        """Commit any spoken-but-uncommitted assistant text to the context now.
+
+        Called synchronously (same event loop, shared ``LLMContext``) right
+        before anything that snapshots the context for inference: the paired
+        user aggregator's message write and this aggregator's own upstream
+        context pushes. This closes the structural race where the assistant
+        commit normally waits for a closing frame (LLMFullResponseEndFrame /
+        LLMAssistantPushAggregationFrame / InterruptionFrame) to traverse the
+        pipeline to the tail — frames that can lag playback end by seconds
+        (e.g. a live TTS provider context closing late) and that always lose
+        to a transcript-driven user turn stop at the pipeline head.
+
+        No-op when nothing has been aggregated, so late closing frames for
+        an already-flushed utterance commit nothing and open turns with no
+        text yet are left untouched.
+        """
+        if not self._aggregation:
+            return
+        await self._trigger_assistant_turn_stopped(interrupted=self._bot_speaking)
 
     async def _handle_llm_run(self, frame: LLMRunFrame):
         await self.push_context_frame(FrameDirection.UPSTREAM)
@@ -1613,14 +1683,11 @@ class LLMAssistantAggregator(LLMContextAggregator):
             await self.push_context_frame(FrameDirection.UPSTREAM)
 
     async def _handle_interruptions(self, frame: InterruptionFrame):
-        # Safety net: TTSTextFrames may have accumulated after the assistant turn
-        # was already closed — e.g. a deferred LLMFullResponseEndFrame emitted at
-        # the end of an interleaved TTSSpeakFrame utterance (pre-tool filler)
-        # consumed the turn before the LLM's own words finished playing. Commit
-        # them instead of silently dropping spoken text from the context.
-        if not self._assistant_turn_start_timestamp and self._aggregation:
-            logger.debug(f"{self}: committing orphaned assistant aggregation on interruption")
-            await self.push_aggregation()
+        # Orphaned aggregation (words that arrived after the turn was already
+        # closed, e.g. by a deferred LLMFullResponseEndFrame of an interleaved
+        # TTSSpeakFrame utterance) is committed by
+        # _trigger_assistant_turn_stopped itself — spoken text is never
+        # silently dropped, whichever closing signal arrives first.
         await self._trigger_assistant_turn_stopped(interrupted=True)
         self._current_tts_append_to_context = None
         await self.reset()
@@ -2033,8 +2100,19 @@ class LLMAssistantAggregator(LLMContextAggregator):
         await self._call_event_handler("on_assistant_turn_started")
 
     async def _trigger_assistant_turn_stopped(self, *, interrupted: bool = False):
-        if not self._assistant_turn_start_timestamp:
+        # Commit whenever there is either an open turn to close or spoken
+        # text to write. Text without an open turn ("orphaned" aggregation —
+        # playback-paced words that landed after the turn was closed by a
+        # deferred end frame, or words that keep playing after an early
+        # flush_spoken_aggregation) must still be committed by whichever
+        # closing signal arrives first; dropping it would erase speech the
+        # user actually heard from the context.
+        if not self._assistant_turn_start_timestamp and not self._aggregation:
             return
+
+        timestamp = self._assistant_turn_start_timestamp or time_now_iso8601()
+        if not self._assistant_turn_start_timestamp:
+            logger.debug(f"{self}: committing orphaned assistant aggregation")
 
         aggregation = await self.push_aggregation()
         if aggregation:
@@ -2044,14 +2122,14 @@ class LLMAssistantAggregator(LLMContextAggregator):
         message = AssistantTurnStoppedMessage(
             content=aggregation,
             interrupted=interrupted,
-            timestamp=self._assistant_turn_start_timestamp,
+            timestamp=timestamp,
         )
         await self._call_event_handler("on_assistant_turn_stopped", message)
         if aggregation:
             await self.broadcast_frame(
                 LLMContextAssistantTurnFrame,
                 text=aggregation,
-                timestamp=self._assistant_turn_start_timestamp,
+                timestamp=timestamp,
             )
 
         self._assistant_turn_start_timestamp = ""
@@ -2161,13 +2239,18 @@ class LLMContextAggregatorPair:
             params=assistant_params,
             _realtime_service_mode=realtime_service_mode,
         )
-        # Cross-half wiring is one-way and only needed in realtime mode.
-        # Realtime mode treats the assistant response start as the user
-        # turn's end signal: the assistant half triggers a (possibly
-        # deferred) flush of the user half so the user message lands in
-        # context before the assistant turn starts. The user side has
-        # nothing to flush back — the assistant writes its own message
-        # when its response ends, just like cascade mode does.
+        # Cross-half wiring.
+        #
+        # user → assistant (all modes): before the user half writes a user
+        # message and triggers inference, it synchronously flushes the
+        # assistant half's already-spoken text so the inference context
+        # always contains the speech the user just heard, in causal order.
+        # assistant → user (realtime mode only): realtime mode treats the
+        # assistant response start as the user turn's end signal, so the
+        # assistant half triggers a (possibly deferred) flush of the user
+        # half so the user message lands in context before the assistant
+        # turn starts.
+        self._user._paired_assistant_aggregator = self._assistant
         if realtime_service_mode:
             self._assistant._paired_user_aggregator = self._user
 
