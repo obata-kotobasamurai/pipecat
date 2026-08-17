@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+import asyncio
 import json
 from unittest.mock import AsyncMock
 
@@ -20,6 +21,7 @@ class _FakeWebsocket:
         self._messages = messages
         self.state = state
         self.send = AsyncMock(side_effect=send_side_effect)
+        self.close = AsyncMock()
 
     def __aiter__(self):
         return self._iter_messages()
@@ -38,10 +40,129 @@ async def test_connect_failure_clears_stale_websocket_without_raising(monkeypatc
 
     service = SonioxSTTService(api_key="test-key")
     service._websocket = _FakeWebsocket([], state=State.CLOSED)
+    service.push_error = AsyncMock()
 
     await service._connect_websocket()
 
     assert service._websocket is None
+    service.push_error.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_preconnect_configures_sample_rate_without_starting_tasks(monkeypatch):
+    websocket = _FakeWebsocket([])
+    connect = AsyncMock(return_value=websocket)
+    monkeypatch.setattr("pipecat.services.soniox.stt.websocket_connect", connect)
+
+    service = SonioxSTTService(api_key="test-key", sample_rate=8000)
+
+    assert await service.preconnect_websocket() is True
+
+    connect.assert_awaited_once()
+    config = json.loads(websocket.send.await_args.args[0])
+    assert config["sample_rate"] == 8000
+    assert service._receive_task is None
+    assert service._keepalive_task is None
+
+
+@pytest.mark.asyncio
+async def test_start_adopts_preconnected_websocket_once(monkeypatch):
+    websocket = _FakeWebsocket([])
+    connect = AsyncMock(return_value=websocket)
+    monkeypatch.setattr("pipecat.services.soniox.stt.websocket_connect", connect)
+
+    service = SonioxSTTService(api_key="test-key", sample_rate=16000)
+    assert await service.preconnect_websocket() is True
+
+    keepalive_starts = 0
+    receive_gate = asyncio.Event()
+
+    def fake_create_keepalive_task():
+        nonlocal keepalive_starts
+        keepalive_starts += 1
+
+    async def fake_receive_handler(_report_error):
+        await receive_gate.wait()
+
+    monkeypatch.setattr(service, "_create_keepalive_task", fake_create_keepalive_task)
+    monkeypatch.setattr(service, "_receive_task_handler", fake_receive_handler)
+    monkeypatch.setattr(service, "create_task", asyncio.create_task)
+
+    from pipecat.frames.frames import StartFrame
+
+    await service.start(StartFrame(audio_in_sample_rate=16000))
+
+    connect.assert_awaited_once()
+    assert websocket.send.await_count == 1
+    assert keepalive_starts == 1
+    assert service._receive_task is not None
+    assert service._preconnected_websocket is False
+
+    service._receive_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await service._receive_task
+
+
+@pytest.mark.asyncio
+async def test_cancelled_preconnect_closes_acquired_websocket(monkeypatch):
+    send_started = asyncio.Event()
+
+    async def blocked_send(_message):
+        send_started.set()
+        await asyncio.Event().wait()
+
+    websocket = _FakeWebsocket([], send_side_effect=blocked_send)
+    monkeypatch.setattr(
+        "pipecat.services.soniox.stt.websocket_connect", AsyncMock(return_value=websocket)
+    )
+    service = SonioxSTTService(api_key="test-key", sample_rate=8000)
+
+    task = asyncio.create_task(service.preconnect_websocket())
+    await send_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    websocket.close.assert_awaited_once()
+    assert service._websocket is None
+    assert service._preconnected_websocket is False
+
+
+@pytest.mark.asyncio
+async def test_failed_preconnect_closes_socket_and_can_retry(monkeypatch):
+    failed_websocket = _FakeWebsocket([], send_side_effect=RuntimeError("config failed"))
+    healthy_websocket = _FakeWebsocket([])
+    connect = AsyncMock(side_effect=[failed_websocket, healthy_websocket])
+    monkeypatch.setattr("pipecat.services.soniox.stt.websocket_connect", connect)
+    service = SonioxSTTService(api_key="test-key", sample_rate=8000)
+    service.push_error = AsyncMock()
+
+    assert await service.preconnect_websocket() is False
+    failed_websocket.close.assert_awaited_once()
+    assert service._websocket is None
+    service.push_error.assert_not_awaited()
+
+    assert await service.preconnect_websocket() is True
+    assert connect.await_count == 2
+    assert service._websocket is healthy_websocket
+
+
+@pytest.mark.asyncio
+async def test_receive_messages_reports_tokenless_error(monkeypatch):
+    service = SonioxSTTService(api_key="test-key")
+    service._websocket = _FakeWebsocket(
+        [json.dumps({"error_code": 401, "error_message": "invalid api key", "finished": True})]
+    )
+    errors = []
+
+    async def fake_push_error(*, error_msg, **_kwargs):
+        errors.append(error_msg)
+
+    monkeypatch.setattr(service, "push_error", fake_push_error)
+
+    await service._receive_messages()
+
+    assert errors == ["Error: 401 (_receive_messages) - invalid api key"]
 
 
 def test_language_from_tokens_uses_single_recognized_language():

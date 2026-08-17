@@ -6,6 +6,7 @@
 
 """Soniox speech-to-text service implementation."""
 
+import asyncio
 import json
 import time
 from collections import Counter
@@ -367,6 +368,9 @@ class SonioxSTTService(WebsocketSTTService):
         self._last_tokens_received: float | None = None
 
         self._receive_task = None
+        self._websocket_connect_lock = asyncio.Lock()
+        self._preconnect_lifecycle_lock = asyncio.Lock()
+        self._preconnected_websocket = False
 
     def can_generate_metrics(self) -> bool:
         """Check if this service can generate processing metrics.
@@ -382,8 +386,45 @@ class SonioxSTTService(WebsocketSTTService):
         Args:
             frame: The start frame containing initialization parameters.
         """
-        await super().start(frame)
-        await self._connect()
+        async with self._preconnect_lifecycle_lock:
+            await super().start(frame)
+            await self._connect()
+            # The normal pipeline lifecycle owns the websocket from this point.
+            self._preconnected_websocket = False
+
+    async def preconnect_websocket(self) -> bool:
+        """Connect and configure Soniox before a pipeline sends its StartFrame.
+
+        This deliberately does not start receive or keepalive tasks because those
+        tasks require the pipeline task manager installed during normal startup.
+        The configured websocket is adopted by :meth:`start` later.
+
+        Returns:
+            True when an open websocket is ready for the normal start lifecycle.
+        """
+        async with self._preconnect_lifecycle_lock:
+            if not self._init_sample_rate or self._init_sample_rate <= 0:
+                logger.warning(
+                    f"{self}: Soniox preconnect requires a positive initialization sample rate"
+                )
+                return False
+
+            if self.sample_rate == 0:
+                self._sample_rate = self._init_sample_rate
+
+            await self._connect_websocket(report_error=False)
+            self._preconnected_websocket = bool(
+                self._websocket and self._websocket.state is State.OPEN
+            )
+            return self._preconnected_websocket
+
+    async def abort_preconnect(self) -> None:
+        """Close a preconnected websocket that the pipeline did not adopt."""
+        async with self._preconnect_lifecycle_lock:
+            if not self._preconnected_websocket:
+                return
+            self._preconnected_websocket = False
+            await self._disconnect_websocket()
 
     async def _update_settings(self, delta: Settings) -> dict[str, Any]:
         """Apply settings delta and reconnect if anything changed.
@@ -426,6 +467,11 @@ class SonioxSTTService(WebsocketSTTService):
         """
         await super().cancel(frame)
         await self._disconnect()
+
+    async def cleanup(self):
+        """Clean up an unadopted preconnection before normal service cleanup."""
+        await self.abort_preconnect()
+        await super().cleanup()
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:
         """Send audio data to Soniox STT Service.
@@ -497,56 +543,79 @@ class SonioxSTTService(WebsocketSTTService):
 
         await self._disconnect_websocket()
 
-    async def _connect_websocket(self):
+    def _build_websocket_config(self) -> dict[str, Any]:
+        """Build the initial Soniox websocket configuration."""
+        # If vad_force_turn_endpoint is not enabled, we need to enable endpoint detection.
+        # Either one or the other is required.
+        enable_endpoint_detection = not self._vad_force_turn_endpoint
+
+        settings = self._settings
+        context = settings.context
+        if isinstance(context, SonioxContextObject):
+            context = context.model_dump()
+
+        return {
+            "api_key": self._api_key,
+            "model": settings.model,
+            "audio_format": self._audio_format,
+            "num_channels": self._num_channels,
+            "enable_endpoint_detection": enable_endpoint_detection,
+            "max_endpoint_delay_ms": settings.max_endpoint_delay_ms,
+            "endpoint_sensitivity": settings.endpoint_sensitivity,
+            "sample_rate": self.sample_rate,
+            "language_hints": _prepare_language_hints(assert_given(settings.language_hints)),
+            "language_hints_strict": settings.language_hints_strict,
+            "context": context,
+            "enable_speaker_diarization": settings.enable_speaker_diarization,
+            "enable_language_identification": settings.enable_language_identification,
+            "client_reference_id": settings.client_reference_id,
+        }
+
+    async def _connect_websocket(self, *, report_error: bool = True):
         """Establish the websocket connection to Soniox."""
+        async with self._websocket_connect_lock:
+            websocket = None
+            try:
+                if self._websocket and self._websocket.state is State.OPEN:
+                    return
+                if self._websocket:
+                    await self._close_failed_websocket(self._websocket)
+
+                logger.debug("Connecting to Soniox STT")
+
+                websocket = await websocket_connect(self._url)
+                self._websocket = websocket
+
+                if not websocket:
+                    raise Exception(f"Unable to connect to Soniox API at {self._url}")
+
+                # Send the configuration message.
+                await websocket.send(json.dumps(self._build_websocket_config()))
+
+                await self._call_event_handler("on_connected")
+                logger.debug("Connected to Soniox STT")
+            except asyncio.CancelledError:
+                await self._close_failed_websocket(websocket)
+                raise
+            except Exception as e:
+                await self._close_failed_websocket(websocket)
+                if report_error:
+                    await self.push_error(
+                        error_msg=f"Unable to connect to Soniox: {e}", exception=e
+                    )
+                else:
+                    logger.debug(f"{self}: speculative Soniox preconnect failed: {e}")
+
+    async def _close_failed_websocket(self, websocket) -> None:
+        """Close a websocket acquired by a failed or cancelled handshake."""
         try:
-            if self._websocket and self._websocket.state is State.OPEN:
-                return
-
-            logger.debug("Connecting to Soniox STT")
-
-            self._websocket = await websocket_connect(self._url)
-
-            if not self._websocket:
-                await self.push_error(error_msg=f"Unable to connect to Soniox API at {self._url}")
-                raise Exception(f"Unable to connect to Soniox API at {self._url}")
-
-            # If vad_force_turn_endpoint is not enabled, we need to enable endpoint detection.
-            # Either one or the other is required.
-            enable_endpoint_detection = not self._vad_force_turn_endpoint
-
-            s = self._settings
-
-            context = s.context
-            if isinstance(context, SonioxContextObject):
-                context = context.model_dump()
-
-            # Send the initial configuration message.
-            config = {
-                "api_key": self._api_key,
-                "model": s.model,
-                "audio_format": self._audio_format,
-                "num_channels": self._num_channels,
-                "enable_endpoint_detection": enable_endpoint_detection,
-                "max_endpoint_delay_ms": s.max_endpoint_delay_ms,
-                "endpoint_sensitivity": s.endpoint_sensitivity,
-                "sample_rate": self.sample_rate,
-                "language_hints": _prepare_language_hints(assert_given(s.language_hints)),
-                "language_hints_strict": s.language_hints_strict,
-                "context": context,
-                "enable_speaker_diarization": s.enable_speaker_diarization,
-                "enable_language_identification": s.enable_language_identification,
-                "client_reference_id": s.client_reference_id,
-            }
-
-            # Send the configuration message.
-            await self._websocket.send(json.dumps(config))
-
-            await self._call_event_handler("on_connected")
-            logger.debug("Connected to Soniox STT")
-        except Exception as e:
-            self._websocket = None
-            await self.push_error(error_msg=f"Unable to connect to Soniox: {e}", exception=e)
+            if websocket:
+                await websocket.close()
+        except Exception as close_error:
+            logger.debug(f"{self}: error closing failed Soniox websocket: {close_error}")
+        finally:
+            if self._websocket is websocket:
+                self._websocket = None
 
     async def _disconnect_websocket(self):
         """Close the websocket connection to Soniox."""
@@ -617,7 +686,7 @@ class SonioxSTTService(WebsocketSTTService):
             try:
                 content = json.loads(message)
 
-                tokens = content["tokens"]
+                tokens = content.get("tokens") or []
 
                 if tokens:
                     if len(tokens) == 1 and tokens[0]["text"] == FINALIZED_TOKEN:
