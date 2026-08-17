@@ -4,7 +4,6 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-import asyncio
 import builtins
 import json
 import math
@@ -96,32 +95,3 @@ def test_deferred_loaders_coalesce_concurrent_calls(monkeypatch):
     assert all(tokenizer is tokenizers[0] for tokenizer in tokenizers)
     assert all(module is loudness_modules[0] for module in loudness_modules)
     assert pyloudnorm_imports == 1
-
-
-@pytest.mark.asyncio
-async def test_pipeline_worker_schedules_deferred_warmup(monkeypatch):
-    from pipecat.frames.frames import EndFrame
-    from pipecat.pipeline import worker as worker_module
-    from pipecat.pipeline.pipeline import Pipeline
-    from pipecat.pipeline.worker import PipelineWorker, WorkerParams
-    from pipecat.processors.filters.identity_filter import IdentityFilter
-
-    warmed = threading.Event()
-    release = threading.Event()
-
-    def slow_warmup():
-        warmed.set()
-        release.wait(timeout=2)
-
-    monkeypatch.setattr(worker_module, "warm_deferred_imports", slow_warmup)
-    worker = PipelineWorker(Pipeline([IdentityFilter()]))
-    await worker.queue_frame(EndFrame())
-
-    try:
-        await worker.run(WorkerParams(loop=asyncio.get_running_loop()))
-    finally:
-        release.set()
-
-    assert warmed.wait(timeout=1)
-    assert worker._deferred_warmup_task is None
-    assert worker.task_manager.current_tasks() == []

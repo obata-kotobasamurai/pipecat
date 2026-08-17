@@ -80,7 +80,6 @@ from pipecat.processors.frameworks.rtvi.models import (
 )
 from pipecat.utils.asyncio.task_manager import BaseTaskManager, TaskManager, TaskManagerParams
 from pipecat.utils.deprecation import deprecated
-from pipecat.utils.prewarm import warm_deferred_imports
 from pipecat.utils.startup import run_setup_hook
 from pipecat.utils.tracing.setup import is_tracing_available
 from pipecat.utils.tracing.tracing_context import TracingContext
@@ -372,7 +371,6 @@ class PipelineWorker(BaseWorker):
         # This queue is the queue used to push frames to the pipeline.
         self._push_queue = asyncio.Queue()
         self._process_push_task: asyncio.Task | None = None
-        self._deferred_warmup_task: asyncio.Task | None = None
 
         # This is the heartbeat queue. When a heartbeat frame is received in the
         # down queue we add it to the heartbeat queue for processing.
@@ -923,10 +921,6 @@ class PipelineWorker(BaseWorker):
             await self.cancel_task(self._process_push_task)
             self._process_push_task = None
 
-        if self._deferred_warmup_task:
-            await self.cancel_task(self._deferred_warmup_task)
-            self._deferred_warmup_task = None
-
         await self._maybe_cancel_heartbeat_tasks()
         await self._maybe_cancel_idle_task()
 
@@ -1079,12 +1073,6 @@ class PipelineWorker(BaseWorker):
         self._clock.start()
 
         self._maybe_start_idle_task()
-
-        # Services spend most of the start sequence waiting on the network, which
-        # leaves room to load the imports deferred out of pipeline construction.
-        self._deferred_warmup_task = self.create_task(
-            asyncio.to_thread(warm_deferred_imports), name="warm_deferred_imports"
-        )
 
         start_frame = StartFrame(
             audio_in_sample_rate=self._params.audio_in_sample_rate,
