@@ -12,9 +12,10 @@ various audio formats used in Pipecat pipelines.
 """
 
 import audioop
+import threading
+from types import ModuleType
 
 import numpy as np
-import pyloudnorm as pyln
 
 from pipecat.audio.resamplers.base_audio_resampler import BaseAudioResampler
 from pipecat.audio.resamplers.soxr_resampler import SOXRAudioResampler
@@ -23,6 +24,23 @@ from pipecat.audio.resamplers.soxr_stream_resampler import SOXRStreamAudioResamp
 # Normal speech usually results in many samples between ±500 to ±5000, depending on loudness and mic gain.
 # So we are using a threshold that is well below what real speech produces.
 SPEAKING_THRESHOLD = 20
+_PYLOUDNORM_LOAD_LOCK = threading.Lock()
+_PYLOUDNORM_MODULE: ModuleType | None = None
+
+
+def _pyloudnorm() -> ModuleType:
+    """Load pyloudnorm only when volume analysis is about to begin."""
+    global _PYLOUDNORM_MODULE
+
+    if _PYLOUDNORM_MODULE is not None:
+        return _PYLOUDNORM_MODULE
+
+    with _PYLOUDNORM_LOAD_LOCK:
+        if _PYLOUDNORM_MODULE is None:
+            import pyloudnorm
+
+            _PYLOUDNORM_MODULE = pyloudnorm
+        return _PYLOUDNORM_MODULE
 
 
 def create_file_resampler(**kwargs) -> BaseAudioResampler:
@@ -139,7 +157,7 @@ def calculate_audio_volume(audio: bytes, sample_rate: int) -> float:
     audio_float = audio_np.astype(np.float64)
 
     block_size = audio_np.size / sample_rate
-    meter = pyln.Meter(sample_rate, block_size=block_size)
+    meter = _pyloudnorm().Meter(sample_rate, block_size=block_size)
     loudness = meter.integrated_loudness(audio_float)
 
     # Loudness goes from -20 to 80 (more or less), where -20 is quiet and 80 is
