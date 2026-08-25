@@ -377,7 +377,7 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
         self._skip_tts: bool | None = None
         self._summary_task: asyncio.Task | None = None
 
-        self._register_event_handler("on_function_calls_started")
+        self._register_event_handler("on_function_calls_started", sync=True)
         self._register_event_handler("on_function_calls_cancelled")
         self._register_event_handler("on_completion_timeout")
 

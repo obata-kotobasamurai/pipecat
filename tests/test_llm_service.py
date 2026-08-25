@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -80,6 +81,37 @@ class TestLLMService(unittest.IsolatedAsyncioTestCase):
 
         service._run_parallel_function_calls = run_inline
         service._run_sequential_function_calls = run_inline
+
+    async def test_function_calls_started_handlers_finish_before_tool_execution(self):
+        service = MockLLMService()
+        await self._run_function_calls_inline(service)
+        service.broadcast_frame = AsyncMock()
+        order = []
+
+        async def on_function_calls_started(_service, _function_calls):
+            order.append("started")
+            await asyncio.sleep(0.01)
+            order.append("prepared")
+
+        async def tool_handler(params):
+            order.append("tool")
+            await params.result_callback("done")
+
+        service.add_event_handler("on_function_calls_started", on_function_calls_started)
+        service.register_function("test_tool", tool_handler)
+
+        await service.run_function_calls(
+            [
+                FunctionCallFromLLM(
+                    function_name="test_tool",
+                    tool_call_id="call_1",
+                    arguments={},
+                    context=LLMContext(),
+                )
+            ]
+        )
+
+        self.assertEqual(order, ["started", "prepared", "tool"])
 
     async def test_missing_function_call_emits_terminal_result(self):
         service = MockLLMService()
